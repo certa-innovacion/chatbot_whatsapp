@@ -44,6 +44,11 @@ function update(nexp, data = {}) {
     return {};
   }
   const existing = read(nexp);
+
+  // asegurar estructuras base
+  if (!existing.historial_respuestas) existing.historial_respuestas = [];
+  if (!existing.mensajes) existing.mensajes = [];
+
   const merged = deepMerge(existing, data);
   merged.ultima_actualizacion = new Date().toISOString();
 
@@ -54,7 +59,7 @@ function update(nexp, data = {}) {
 }
 
 /**
- * Añade una entrada al historial de respuestas del usuario.
+ * Añade una entrada al historial de respuestas del usuario (modo antiguo)
  */
 function addRespuesta(nexp, stage, pregunta, respuesta) {
   if (!nexp) return;
@@ -69,6 +74,51 @@ function addRespuesta(nexp, stage, pregunta, respuesta) {
   });
 
   update(nexp, { historial_respuestas: existing.historial_respuestas });
+}
+
+/**
+ * NUEVO: añade un mensaje “tipo chat” (entrada o salida)
+ */
+function addMensaje(nexp, msg = {}) {
+  if (!nexp) return;
+  const existing = read(nexp);
+  if (!existing.mensajes) existing.mensajes = [];
+
+  const entry = {
+    timestamp: new Date().toISOString(),
+    direction: msg.direction || 'out', // 'out' | 'in'
+    type: msg.type || 'text', // 'text' | 'template' | 'button' | 'interactive' | 'status'
+    text: msg.text || '',
+    from: msg.from || null,
+    to: msg.to || null,
+    meta: msg.meta || {},
+  };
+
+  existing.mensajes.push(entry);
+  update(nexp, { mensajes: existing.mensajes });
+}
+
+/**
+ * NUEVO: actualiza status de un mensaje enviado por wamid
+ */
+function updateMensajeStatusById(nexp, wamid, status, extra = {}) {
+  if (!nexp || !wamid) return;
+  const existing = read(nexp);
+  if (!existing.mensajes) existing.mensajes = [];
+
+  // buscamos el último “out” con ese wamid
+  for (let i = existing.mensajes.length - 1; i >= 0; i--) {
+    const m = existing.mensajes[i];
+    if (m?.direction === 'out' && m?.meta?.wamid === wamid) {
+      m.meta = m.meta || {};
+      m.meta.status = status;
+      m.meta.status_at = new Date().toISOString();
+      m.meta = { ...m.meta, ...extra };
+      break;
+    }
+  }
+
+  update(nexp, { mensajes: existing.mensajes });
 }
 
 /**
@@ -111,6 +161,8 @@ module.exports = {
   read,
   update,
   addRespuesta,
+  addMensaje,
+  updateMensajeStatusById,
   listAll,
   SINIESTROS_DIR,
 };

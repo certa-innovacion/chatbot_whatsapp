@@ -46,7 +46,7 @@ app.get('/webhook', (req, res) => {
   }
 });
 
-// ── Webhook POST: Mensajes entrantes ─────────────────────────────────────
+// ── Webhook POST: Mensajes entrantes + statuses ──────────────────────────
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200); // Responder rápido a Meta
 
@@ -55,7 +55,34 @@ app.post('/webhook', async (req, res) => {
     if (body.object !== 'whatsapp_business_account') return;
 
     const value = body.entry?.[0]?.changes?.[0]?.value;
-    if (!value?.messages?.length) return;
+    if (!value) return;
+
+    // 1) STATUS UPDATES (sent/delivered/read/failed)
+    if (Array.isArray(value.statuses) && value.statuses.length > 0) {
+      for (const st of value.statuses) {
+        const recipient = st.recipient_id; // teléfono destino (sin +)
+        const wamid = st.id;
+        const status = st.status; // sent | delivered | read | failed
+        const ts = st.timestamp;
+
+        const conv = recipient ? conversationManager.getConversation(recipient) : null;
+        const nexp = conv?.userData?.nexp || null;
+
+        console.log(`📡 STATUS [${recipient || '—'}] ${status} → ${wamid}`);
+
+        if (nexp) {
+          siniestroStore.updateMensajeStatusById(nexp, wamid, status, {
+            status_timestamp: ts,
+            errors: st.errors || null,
+            conversation: st.conversation || null,
+            pricing: st.pricing || null
+          });
+        }
+      }
+    }
+
+    // 2) INCOMING MESSAGES
+    if (!Array.isArray(value.messages) || value.messages.length === 0) return;
 
     for (const message of value.messages) {
       const from = message.from;
@@ -65,6 +92,8 @@ app.post('/webhook', async (req, res) => {
 
       // Extraer texto
       let text = '';
+      let detectedType = message.type || 'text';
+
       if (message.type === 'text') text = message.text.body;
       else if (message.type === 'button') text = message.button.text;
       else if (message.type === 'interactive') {
@@ -75,19 +104,38 @@ app.post('/webhook', async (req, res) => {
       }
 
       if (!text?.trim()) continue;
+
       console.log(`\n📥 [${from}] "${text}"`);
+
+      // intentar obtener nexp desde la conversación
+      const conv = conversationManager.getConversation(from);
+      const nexp = conv?.userData?.nexp || null;
+
+      // Persistir IN
+      if (nexp) {
+        siniestroStore.addMensaje(nexp, {
+          direction: 'in',
+          type: detectedType,
+          from,
+          text,
+          meta: {
+            meta_message_id: message.id,
+            raw_type: message.type
+          }
+        });
+      }
 
       // Procesar
       const reply = await processMessage(text, from);
 
-      // Enviar respuesta (una sola vez)
+      // Enviar respuesta (y persistir OUT con wamid)
       if (reply && typeof reply === 'object' && reply.type === 'template') {
-        await sendTemplateMessage(from, reply.name, reply.language || 'es', reply.components || []);
+        await sendTemplateMessage(from, reply.name, reply.language || 'es', reply.components || [], { nexp });
+        console.log(`📤 [${from}] Enviado (template:${reply.name})`);
       } else if (reply && typeof reply === 'string' && reply.length > 0) {
-        await sendTextMessage(from, reply);
+        await sendTextMessage(from, reply, { nexp });
+        console.log(`📤 [${from}] Enviado (${reply.length} chars)`);
       }
-
-      console.log(`📤 [${from}] Enviado (${typeof reply === 'string' ? reply.length + ' chars' : 'template'})`);
     }
   } catch (error) {
     console.error('❌ Webhook error:', error.message);
@@ -97,9 +145,9 @@ app.post('/webhook', async (req, res) => {
 // ── Test: enviar mensaje ─────────────────────────────────────────────────
 app.post('/send', async (req, res) => {
   try {
-    const { to, message } = req.body;
+    const { to, message, nexp } = req.body;
     if (!to || !message) return res.status(400).json({ error: 'Faltan: to, message' });
-    const result = await sendTextMessage(to, message);
+    const result = await sendTextMessage(to, message, { nexp });
     return res.json(result);
   } catch (error) {
     return res.status(500).json({

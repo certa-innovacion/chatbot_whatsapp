@@ -1,55 +1,65 @@
 // src/bot/utils/phone.js
 
 /**
- * Normaliza un número de teléfono a formato WhatsApp de Twilio
- * @param {string} input - Número en cualquier formato
- * @returns {string|null} - Formato whatsapp:+E164 o null si inválido
+ * Normaliza un número de teléfono a formato "whatsapp:+E164"
+ * - Acepta: "+34...", "0034...", "34...", "612345678", etc.
+ * - Para números nacionales españoles (9 dígitos, empieza 6-9) añade 34.
+ * - Para números extranjeros: deben venir con prefijo internacional (o con 00).
+ *
+ * Devuelve: "whatsapp:+<digits>" o null si es inválido/ambiguo.
  */
-function normalizeWhatsAppNumber(input) {
-  if (!input) return null;
+function normalizeWhatsAppNumber(input, defaultCountryCode = '34') {
+  if (input === null || input === undefined) return null;
 
-  let num = input.toString().trim();
+  let s = String(input).trim();
 
-  // Quitar prefijo whatsapp:
-  if (num.startsWith('whatsapp:')) {
-    num = num.replace('whatsapp:', '').trim();
+  // Quitar "whatsapp:"
+  s = s.replace(/^whatsapp:/i, '').trim();
+
+  // Dejar solo dígitos y '+'
+  s = s.replace(/[^\d+]/g, '');
+
+  // 00xxxx -> +xxxx
+  if (s.startsWith('00')) s = '+' + s.slice(2);
+
+  // Si NO hay +, puede ser:
+  // - nacional ES (9 dígitos) => le ponemos +34
+  // - ya internacional sin + (muy habitual que venga "34..." o "49...") => si tiene >=10 dígitos lo aceptamos como internacional
+  if (!s.startsWith('+')) {
+    if (/^\d{9}$/.test(s) && /^[6-9]/.test(s)) {
+      s = '+' + defaultCountryCode + s;
+    } else if (/^\d{10,15}$/.test(s)) {
+      s = '+' + s; // asumimos que ya viene con country code
+    } else {
+      return null; // ambiguo / demasiado corto
+    }
   }
 
-  // Quitar espacios
-  num = num.replace(/\s+/g, '');
+  // Validar E.164 básico: + seguido de 8..15 dígitos
+  const digits = s.replace(/^\+/, '');
+  if (!/^\d{8,15}$/.test(digits)) return null;
 
-  // Asegurar +
-  if (!num.startsWith('+')) {
-    num = '+' + num;
-  }
-
-  return `whatsapp:${num}`;
+  return `whatsapp:+${digits}`;
 }
 
 /**
- * Valida que un número tenga el formato correcto para Twilio WhatsApp
- * @param {string} number - Número a validar
- * @returns {boolean} - true si es válido
+ * Valida que un número tenga el formato correcto para "whatsapp:+E164"
  */
 function isValidTwilioWhatsAppTo(number) {
   if (!number) return false;
-  
-  // Debe empezar con whatsapp:+
+
   if (!number.startsWith('whatsapp:+')) return false;
-  
-  // Extraer solo los dígitos después de whatsapp:+
+
   const digits = number.replace('whatsapp:+', '');
-  
-  // Debe tener al menos 10 dígitos (formato internacional)
-  if (digits.length < 10) return false;
-  
-  // Debe contener solo dígitos
+
+  if (digits.length < 8 || digits.length > 15) return false;
+
   if (!/^\d+$/.test(digits)) return false;
-  
+
   return true;
 }
 
-module.exports = { 
+module.exports = {
   normalizeWhatsAppNumber,
   isValidTwilioWhatsAppTo
 };

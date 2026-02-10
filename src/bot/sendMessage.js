@@ -1,6 +1,7 @@
 // src/bot/sendMessage.js - META WHATSAPP API
 require('dotenv').config({ override: true });
 const axios = require('axios');
+const siniestroStore = require('./siniestroStore');
 
 const META_ACCESS_TOKEN = process.env.META_ACCESS_TOKEN;
 const META_PHONE_NUMBER_ID = process.env.META_PHONE_NUMBER_ID;
@@ -20,7 +21,7 @@ function normalizePhoneNumber(phoneNumber) {
   return normalized;
 }
 
-async function sendTextMessage(toNumber, messageText) {
+async function sendTextMessage(toNumber, messageText, opts = {}) {
   const to = normalizePhoneNumber(toNumber);
   if (!to) throw new Error(`Número de teléfono inválido: ${toNumber}`);
 
@@ -44,6 +45,24 @@ async function sendTextMessage(toNumber, messageText) {
         }
       }
     );
+
+    const wamid = response?.data?.messages?.[0]?.id || null;
+
+    // Persistencia (opcional)
+    if (opts?.nexp) {
+      siniestroStore.addMensaje(opts.nexp, {
+        direction: 'out',
+        type: 'text',
+        to,
+        text: messageText,
+        meta: {
+          wamid,
+          status: 'accepted_by_meta',
+          kind: 'text'
+        }
+      });
+    }
+
     console.log('✅ Mensaje enviado correctamente');
     return response.data;
   } catch (error) {
@@ -52,7 +71,7 @@ async function sendTextMessage(toNumber, messageText) {
   }
 }
 
-async function sendTemplateMessage(toNumber, templateName, languageCode = 'es', components = []) {
+async function sendTemplateMessage(toNumber, templateName, languageCode = 'es', components = [], opts = {}) {
   const to = normalizePhoneNumber(toNumber);
   if (!to) throw new Error(`Número de teléfono inválido: ${toNumber}`);
 
@@ -61,20 +80,27 @@ async function sendTemplateMessage(toNumber, templateName, languageCode = 'es', 
   console.log('   Template:', templateName);
   console.log('   Language:', languageCode);
 
+  const requestBody = {
+    messaging_product: 'whatsapp',
+    recipient_type: 'individual',
+    to,
+    type: 'template',
+    template: {
+      name: templateName,
+      language: { code: languageCode },
+      components
+    }
+  };
+
+  // Debug opcional
+  if (process.env.META_DEBUG_PAYLOAD === '1') {
+    console.log('🧾 Payload template:', JSON.stringify(requestBody, null, 2));
+  }
+
   try {
     const response = await axios.post(
       WHATSAPP_API_URL,
-      {
-        messaging_product: 'whatsapp',
-        recipient_type: 'individual',
-        to,
-        type: 'template',
-        template: {
-          name: templateName,
-          language: { code: languageCode },
-          components
-        }
-      },
+      requestBody,
       {
         headers: {
           Authorization: `Bearer ${META_ACCESS_TOKEN}`,
@@ -82,6 +108,26 @@ async function sendTemplateMessage(toNumber, templateName, languageCode = 'es', 
         }
       }
     );
+
+    const wamid = response?.data?.messages?.[0]?.id || null;
+
+    // Persistencia (opcional)
+    if (opts?.nexp) {
+      siniestroStore.addMensaje(opts.nexp, {
+        direction: 'out',
+        type: 'template',
+        to,
+        text: `[TEMPLATE:${templateName}]`,
+        meta: {
+          wamid,
+          status: 'accepted_by_meta',
+          templateName,
+          languageCode,
+          components
+        }
+      });
+    }
+
     console.log('✅ Template enviado correctamente');
     return response.data;
   } catch (error) {
@@ -91,16 +137,9 @@ async function sendTemplateMessage(toNumber, templateName, languageCode = 'es', 
 }
 
 /**
- * Envío POSICIONAL (la Cloud API no admite "name" dentro de parameters).
- * Sirve tanto para templates POSITIONAL como "NAMED" en catálogo, porque el envío es por ORDEN.
- *
- * componentsSpec ejemplo:
- * {
- *   header: ["Buenos días"],
- *   body: ["Allianz", "6585...", "Robo / ..."]
- * }
+ * Envío POSICIONAL
  */
-async function sendTemplatePositional(toNumber, templateName, componentsSpec = {}, languageCode = 'es') {
+async function sendTemplatePositional(toNumber, templateName, componentsSpec = {}, languageCode = 'es', opts = {}) {
   const components = [];
 
   if (Array.isArray(componentsSpec.header) && componentsSpec.header.length > 0) {
@@ -117,29 +156,26 @@ async function sendTemplatePositional(toNumber, templateName, componentsSpec = {
     });
   }
 
-  return sendTemplateMessage(toNumber, templateName, languageCode, components);
+  return sendTemplateMessage(toNumber, templateName, languageCode, components, opts);
 }
 
 /**
- * Helper específico para tu template "saludo":
+ * Helper específico para "saludo":
  * HEADER: {{saludo}}
  * BODY: {{aseguradora}}, {{nexp}}, {{causa}}
  */
-async function sendSaludoTemplate(toNumber, { saludo, aseguradora, nexp, causa }, languageCode = 'es') {
+async function sendSaludoTemplate(toNumber, { saludo, aseguradora, nexp, causa }, languageCode = 'es', opts = {}) {
   return sendTemplatePositional(
     toNumber,
     'saludo',
-    {
-      header: [saludo],
-      body: [aseguradora, nexp, causa]
-    },
-    languageCode
+    { header: [saludo], body: [aseguradora, nexp, causa] },
+    languageCode,
+    opts
   );
 }
 
 /**
- * Marca un mensaje como leído en WhatsApp
- * @param {string} messageId - ID del mensaje a marcar
+ * Marca un mensaje como leído
  */
 async function markMessageAsRead(messageId) {
   if (!messageId) return;
@@ -160,22 +196,8 @@ async function markMessageAsRead(messageId) {
       }
     );
   } catch (error) {
-    // No lanzar error para no bloquear el flujo principal
     console.warn('⚠️ No se pudo marcar como leído:', error.response?.data?.error?.message || error.message);
   }
-}
-
-/**
- * Envía un template con variables en orden posicional
- * Alias de sendTemplatePositional para compatibilidad
- */
-async function sendTemplateWithVariables(toNumber, templateName, variables = [], languageCode = 'es') {
-  return sendTemplatePositional(
-    toNumber,
-    templateName,
-    { body: variables },
-    languageCode
-  );
 }
 
 module.exports = {
@@ -183,7 +205,6 @@ module.exports = {
   sendTemplateMessage,
   sendTemplatePositional,
   sendSaludoTemplate,
-  sendTemplateWithVariables,
   markMessageAsRead,
   normalizePhoneNumber
 };

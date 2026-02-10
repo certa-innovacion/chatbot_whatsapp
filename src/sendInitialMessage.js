@@ -1,4 +1,4 @@
-// src/sendInitialMessage.js — v8
+// src/sendInitialMessage.js — v8 (patched)
 require('dotenv').config({ override: true });
 
 const XLSX = require('xlsx');
@@ -6,7 +6,7 @@ const path = require('path');
 
 const conversationManager = require('./bot/conversationManager');
 const siniestroStore = require('./bot/siniestroStore');
-const { sendSaludoTemplate, sendTextMessage } = require('./bot/sendMessage');
+const { sendSaludoTemplate, sendTextMessage, normalizePhoneNumber } = require('./bot/sendMessage');
 const { generateResponse } = require('./ai/aiModel');
 
 const EXCEL_PATH = process.env.EXCEL_PATH || path.join(__dirname, '..', 'data', 'allianz_latest.xlsx');
@@ -61,12 +61,21 @@ function capitalizeName(name) {
     .join(' ');
 }
 
-function normalizePhoneES(raw) {
-  const digits = String(raw || '').replace(/\D/g, '');
-  if (!digits) return '';
-  if (digits.startsWith('34')) return digits;
-  if (digits.length === 9) return `34${digits}`;
-  return digits;
+function maskPhone(p) {
+  if (!p) return p;
+  const head = p.slice(0, Math.min(4, p.length));
+  const tail = p.slice(-2);
+  return `${head}***${tail}`;
+}
+
+/**
+ * Normalización para Excel:
+ * - usa la misma lógica que el sender (normalizePhoneNumber),
+ * - y devuelve string vacío si es inválido (para que validation lo marque).
+ */
+function normalizePhoneAny(raw) {
+  const norm = normalizePhoneNumber(raw);
+  return norm || '';
 }
 
 function getSaludo() {
@@ -76,18 +85,22 @@ function getSaludo() {
     timeZone: TZ
   }).format(new Date());
 
+  // tu regla actual:
   return Number(hourStr) < 14 ? 'Buenos días' : 'Buenas tardes';
 }
 
 function validateExcelRow(s) {
   const errors = [];
   if (!s.nexp) errors.push('Falta Encargo (nexp)');
-  if (!s.nombre) errors.push('Falta Nombre');
+  if (!s.nombre) errors.push('Falta Asegurado (nombre)');
   if (!s.telefono) errors.push('Falta Teléfono');
   if (!s.aseguradora) errors.push('Falta Aseguradora');
   if (!s.causa) errors.push('Falta Causa');
   if (!s.fecha || s.fecha === '—') errors.push('Falta Fecha Sin.');
-  if (s.telefono && s.telefono.length < 11) errors.push('Teléfono parece incompleto');
+
+  // teléfono: si existe pero es demasiado corto, probablemente está mal/ambiguo
+  if (s.telefono && s.telefono.length < 10) errors.push('Teléfono parece incompleto/ambiguo');
+
   return { ok: errors.length === 0, errors };
 }
 
@@ -99,16 +112,21 @@ function readExcel(filePath) {
 
   console.log(`📊 Excel leído: ${rows.length} filas de "${sheetName}"`);
 
-  return rows.map(row => ({
-    nexp: String(row['Encargo'] || '').trim(),
-    fecha: formatDate(row['Fecha Sin.']),
-    causa: String(row['Causa'] || '').trim(),
-    aseguradora: String(row['Aseguradora'] || '').trim(),
-    telefono: normalizePhoneES(row['Teléfono']),
-    nombre: capitalizeName(row['Nombre']),
-    estado: String(row['Estado'] || '').trim(),
-    _raw: row
-  }));
+  return rows.map(row => {
+    // ✅ nombre viene de "Asegurado"
+    const asegurado = row['Asegurado'] || row['ASEGURADO'] || row['Asegurado/a'] || row['Nombre'] || '';
+
+    return {
+      nexp: String(row['Encargo'] || '').trim(),
+      fecha: formatDate(row['Fecha Sin.']),
+      causa: String(row['Causa'] || '').trim(),
+      aseguradora: String(row['Aseguradora'] || '').trim(),
+      telefono: normalizePhoneAny(row['Teléfono']),
+      nombre: capitalizeName(asegurado),
+      estado: String(row['Estado'] || '').trim(),
+      _raw: row
+    };
+  });
 }
 
 async function buildVerificationTextWithAI(siniestro) {
@@ -138,7 +156,7 @@ No uses JSON, no pongas encabezados, no uses listas largas.
 async function sendInitial(siniestro) {
   const saludo = getSaludo();
 
-  console.log(`\n📤 Enviando a ${siniestro.nombre} (${siniestro.telefono})...`);
+  console.log(`\n📤 Enviando a ${siniestro.nombre} (${maskPhone(siniestro.telefono)})...`);
   console.log(`   Encargo: ${siniestro.nexp} | Causa: ${siniestro.causa} | Fecha: ${siniestro.fecha}`);
 
   const validation = validateExcelRow(siniestro);
@@ -169,7 +187,12 @@ async function sendInitial(siniestro) {
     datos_corregidos: null
   });
 
-  // 1) Template saludo (posicional por orden, aunque esté catalogado como NAMED)
+  // (opcional) log de validación
+  if (!validation.ok) {
+    console.warn(`⚠️ Validación Excel KO [${siniestro.nexp}]:`, validation.errors.join(' | '));
+  }
+
+  // 1) Template saludo (BODY con 4 params en orden)
   const result = await sendSaludoTemplate(
     siniestro.telefono,
     {
@@ -247,7 +270,7 @@ async function main() {
   if (arg === '--list') {
     console.log('\n📋 Siniestros:\n');
     siniestros.forEach((s, i) => {
-      console.log(`  ${i + 1}. [${s.nexp}] ${s.nombre} — ${s.causa} — Tel: ${s.telefono} — ${s.estado}`);
+      console.log(`  ${i + 1}. [${s.nexp}] ${s.nombre} — ${s.causa} — Tel: ${maskPhone(s.telefono)} — ${s.estado}`);
     });
     process.exit(0);
   }
@@ -257,6 +280,7 @@ async function main() {
     console.log(`\n📤 Enviando a ${pendientes.length} siniestros...\n`);
 
     let ok = 0, fail = 0;
+
     for (const s of pendientes) {
       try {
         await sendInitial(s);
@@ -264,6 +288,16 @@ async function main() {
         await new Promise(r => setTimeout(r, 2000));
       } catch (e) {
         fail++;
+
+        // ✅ LOG DETALLADO (por siniestro)
+        const metaError = e?.response?.data?.error;
+        const metaMsg = metaError?.message || '';
+        const metaDetails = metaError?.error_data?.details || '';
+        console.error(`\n❌ ERROR en [${s.nexp}] Tel:${maskPhone(s.telefono)} Nombre:"${s.nombre}"`);
+        console.error(`   Meta msg: ${metaMsg}`);
+        if (metaDetails) console.error(`   Meta details: ${metaDetails}`);
+        console.error('   Raw:', e?.response?.data || e.message);
+        console.error('');
       }
     }
 
