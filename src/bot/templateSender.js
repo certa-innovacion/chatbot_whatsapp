@@ -1,31 +1,63 @@
-// src/bot/templateSender.js
-const { sendTemplateMessage } = require('./sendMessage');
-const { normalizeWhatsAppNumber } = require('./utils/phone');
+// src/bot/templateSender.js — v4
+const { sendTemplateWithVariables, normalizePhoneNumber } = require('./sendMessage');
 
-const TEMPLATE_NAME = process.env.WA_TPL_SALUDO;
+const LANG = process.env.WA_TEMPLATE_LANG || 'es';
+const TZ = process.env.WA_TIMEZONE || 'Europe/Madrid';
 
-async function sendInitialTemplate(toNumber, templateName, userData = {}) {
-  const template = templateName || TEMPLATE_NAME;
-  
-  if (!template) {
-    throw new Error('Falta nombre del template (WA_TPL_SALUDO en .env)');
-  }
+function getSaludoMadrid(date = new Date()) {
+  const hourStr = new Intl.DateTimeFormat('es-ES', {
+    hour: 'numeric',
+    hour12: false,
+    timeZone: TZ,
+  }).format(date);
 
-  const to = normalizeWhatsAppNumber(toNumber);
+  const h = Number(hourStr);
+  return h < 14 ? 'Buenos días' : 'Buenas tardes';
+}
 
-  console.log('🧩 Enviando template inicial...');
-  console.log('   Template:', template);
-  console.log('   To:', to);
+function safe(v, fallback = '—') {
+  if (v === null || v === undefined) return fallback;
+  const s = String(v).trim();
+  return s.length ? s : fallback;
+}
 
-  // ✅ Template "saludo" NO tiene variables, enviar sin componentes
-  const components = [];
+/**
+ * Template de primer contacto con datos del siniestro
+ * Placeholders esperados (en este orden):
+ * {{1}} = saludo
+ * {{2}} = nombre
+ * {{3}} = aseguradora
+ * {{4}} = nexp (encargo)
+ * {{5}} = fecha siniestro
+ * {{6}} = causa
+ * {{7}} = teléfono
+ *
+ * Botones del template (configurados en Meta):
+ * - "Sí, son correctos"
+ * - "No, hay un error"
+ * - "No soy el asegurado"
+ */
+async function sendConsentTemplate(toNumber, data = {}) {
+  const templateName = process.env.WA_TPL_CONSENT || process.env.WA_TPL_SALUDO;
+  if (!templateName) throw new Error('Falta WA_TPL_CONSENT o WA_TPL_SALUDO en .env');
 
-  console.log('   Components:', JSON.stringify(components, null, 2));
+  const to = normalizePhoneNumber(toNumber);
+  const saludo = getSaludoMadrid();
 
-  // ✅ CORRECTO: template sin variables = array vacío de componentes
-  return sendTemplateMessage(to, template, 'es', components);
+  const variables = [
+    saludo,
+    safe(data.nombre),
+    safe(data.aseguradora, 'Allianz'),
+    safe(data.nexp),
+    safe(data.fecha),
+    safe(data.causa),
+    safe(data.telefono),
+  ];
+
+  return sendTemplateWithVariables(to, templateName, variables, LANG);
 }
 
 module.exports = {
-  sendInitialTemplate,
+  sendConsentTemplate,
+  getSaludoMadrid,
 };

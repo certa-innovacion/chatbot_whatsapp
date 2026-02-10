@@ -1,145 +1,289 @@
-// src/sendInitialMessage.js
-// Script para enviar mensaje inicial usando Meta WhatsApp API
-const { sendInitialTemplate } = require('./bot/templateSender');
+// src/sendInitialMessage.js — v8
+require('dotenv').config({ override: true });
+
+const XLSX = require('xlsx');
+const path = require('path');
+
 const conversationManager = require('./bot/conversationManager');
-require('dotenv').config();
+const siniestroStore = require('./bot/siniestroStore');
+const { sendSaludoTemplate, sendTextMessage } = require('./bot/sendMessage');
+const { generateResponse } = require('./ai/aiModel');
 
-// 📌 CONFIGURACIÓN
-const TO_NUMBER = process.argv[2];
-const TEMPLATE_NAME = process.env.WA_TEMPLATE_INICIAL || process.env.WA_TPL_SALUDO;
+const EXCEL_PATH = process.env.EXCEL_PATH || path.join(__dirname, '..', 'data', 'allianz_latest.xlsx');
+const TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || 'es';
+const TZ = process.env.WA_TIMEZONE || 'Europe/Madrid';
 
-// Datos del usuario (puedes pasarlos como argumentos también)
-const USER_DATA = {
-  direccion: process.argv[3] || process.env.DEFAULT_USER_DATA_DIRECCION || 'Calle Mayor 123, Madrid',
-  fecha: process.argv[4] || process.env.DEFAULT_USER_DATA_FECHA || '15/01/2024',
-  nombre: process.argv[5] || process.env.DEFAULT_USER_DATA_NOMBRE || 'Cliente'
-};
-
-// ✅ VALIDACIONES
-if (!TO_NUMBER) {
-  console.error('❌ Error: Debes proporcionar un número de teléfono');
-  console.log('');
-  console.log('📋 Uso:');
-  console.log('   node src/sendInitialMessage.js <numero>');
-  console.log('   node src/sendInitialMessage.js <numero> <direccion> <fecha> <nombre>');
-  console.log('');
-  console.log('📝 Ejemplos:');
-  console.log('   node src/sendInitialMessage.js 34674742564');
-  console.log('   node src/sendInitialMessage.js 34674742564 "Calle Mayor 5" "10/02/2024" "Juan Pérez"');
-  console.log('');
-  process.exit(1);
+function excelSerialToDate(serial) {
+  const n = Number(serial);
+  if (Number.isNaN(n)) return null;
+  const ms = Math.round((n - 25569) * 86400 * 1000);
+  const d = new Date(ms);
+  return Number.isNaN(d.getTime()) ? null : d;
 }
 
-if (!TEMPLATE_NAME) {
-  console.error('❌ Error: No se encontró nombre del template en .env');
-  console.log('');
-  console.log('💡 Agrega una de estas variables a tu .env:');
-  console.log('   WA_TEMPLATE_INICIAL=saludo');
-  console.log('   o');
-  console.log('   WA_TPL_SALUDO=saludo');
-  console.log('');
-  process.exit(1);
-}
+function formatDate(value) {
+  if (!value) return '—';
 
-// 📤 FUNCIÓN PRINCIPAL
-async function send() {
-  console.log('\n╔════════════════════════════════════════════════════════════╗');
-  console.log('║           ENVIAR MENSAJE INICIAL - META API                ║');
-  console.log('╚════════════════════════════════════════════════════════════╝\n');
-  
-  console.log('📱 Número de teléfono:', TO_NUMBER);
-  console.log('📨 Template:', TEMPLATE_NAME);
-  console.log('');
-  console.log('📋 Datos del usuario:');
-  console.log('   📍 Dirección:', USER_DATA.direccion);
-  console.log('   📅 Fecha:', USER_DATA.fecha);
-  console.log('   👤 Nombre:', USER_DATA.nombre);
-  console.log('');
-
-  try {
-    // Verificar si ya existe una conversación
-    const existingConv = conversationManager.getConversation(TO_NUMBER);
-    
-    if (existingConv) {
-      console.log('⚠️  ADVERTENCIA: Ya existe una conversación con este número');
-      console.log('   Estado actual:', existingConv.status);
-      console.log('   Etapa actual:', existingConv.stage);
-      console.log('   Intentos:', existingConv.attempts || 0);
-      console.log('');
-    }
-
-    console.log('📤 Enviando template inicial...');
-    
-    // Enviar template usando la función actualizada
-    const result = await sendInitialTemplate(TO_NUMBER, TEMPLATE_NAME, USER_DATA);
-    
-    console.log('✅ Template enviado correctamente');
-    console.log('   Message ID:', result.messages[0].id);
-    console.log('');
-    
-    // Registrar conversación en el sistema
-    console.log('💾 Registrando conversación...');
-    conversationManager.createOrUpdateConversation(TO_NUMBER, {
-      status: 'pending',
-      stage: 'initial',
-      attempts: 0,
-      lastMessageAt: Date.now(),
-      lastUserMessageAt: Date.now(),
-      createdAt: Date.now(),
-      userData: USER_DATA,
-      history: [],
-      nextReminderAt: Date.now() + (Number(process.env.REMINDER_INTERVAL_HOURS || 6) * 60 * 60 * 1000)
-    });
-    
-    console.log('✅ Conversación registrada correctamente');
-    console.log('');
-    console.log('╔════════════════════════════════════════════════════════════╗');
-    console.log('║                    ✅ TODO LISTO                           ║');
-    console.log('╚════════════════════════════════════════════════════════════╝\n');
-    console.log('⏳ Esperando respuesta del usuario...');
-    console.log('');
-    console.log('📱 Cuando el usuario responda:');
-    console.log('   → Gemini AI procesará el mensaje automáticamente');
-    console.log('   → La conversación progresará según las respuestas');
-    console.log('');
-    console.log(`⏰ Si no responde en ${process.env.REMINDER_INTERVAL_HOURS || 6} horas:`);
-    console.log('   → Se enviará un recordatorio automático');
-    console.log('');
-
-  } catch (error) {
-    console.error('\n❌ ERROR:', error.message);
-    console.log('');
-    
-    if (error.response?.data) {
-      console.error('📄 Detalles del error de Meta API:');
-      console.error(JSON.stringify(error.response.data, null, 2));
-      console.log('');
-    }
-    
-    console.log('💡 Posibles causas:');
-    console.log('   1. El template no existe o no está aprobado en Meta');
-    console.log('   2. El número no está registrado (modo prueba de Meta)');
-    console.log('   3. El Access Token no es válido o expiró');
-    console.log('   4. El formato del número es incorrecto');
-    console.log('');
-    console.log('🔧 Verificaciones:');
-    console.log(`   - Template "${TEMPLATE_NAME}" existe en WhatsApp Manager`);
-    console.log(`   - Número ${TO_NUMBER} está en formato: 34XXXXXXXXX (sin +)`);
-    console.log('   - Access Token es válido en .env');
-    console.log('   - Phone Number ID es correcto en .env');
-    console.log('');
-    
-    throw error;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    const dd = String(value.getDate()).padStart(2, '0');
+    const mm = String(value.getMonth() + 1).padStart(2, '0');
+    const yy = value.getFullYear();
+    return `${dd}/${mm}/${yy}`;
   }
+
+  if (typeof value === 'number' || (typeof value === 'string' && /^[0-9]+(\.[0-9]+)?$/.test(value.trim()))) {
+    const n = Number(value);
+    if (!Number.isNaN(n) && n > 20000 && n < 90000) {
+      const d = excelSerialToDate(n);
+      if (d) return formatDate(d);
+    }
+  }
+
+  if (typeof value === 'string') {
+    const s = value.trim();
+    if (s.includes('T') && s.includes('-')) {
+      const parts = s.split('T')[0].split('-');
+      if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
+    }
+    if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return s;
+    return s;
+  }
+
+  return String(value);
 }
 
-// 🚀 EJECUCIÓN
-send()
-  .then(() => {
-    console.log('🎉 Script finalizado exitosamente\n');
+function capitalizeName(name) {
+  return String(name || '')
+    .toLowerCase()
+    .split(' ')
+    .filter(Boolean)
+    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(' ');
+}
+
+function normalizePhoneES(raw) {
+  const digits = String(raw || '').replace(/\D/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('34')) return digits;
+  if (digits.length === 9) return `34${digits}`;
+  return digits;
+}
+
+function getSaludo() {
+  const hourStr = new Intl.DateTimeFormat('es-ES', {
+    hour: 'numeric',
+    hour12: false,
+    timeZone: TZ
+  }).format(new Date());
+
+  return Number(hourStr) < 14 ? 'Buenos días' : 'Buenas tardes';
+}
+
+function validateExcelRow(s) {
+  const errors = [];
+  if (!s.nexp) errors.push('Falta Encargo (nexp)');
+  if (!s.nombre) errors.push('Falta Nombre');
+  if (!s.telefono) errors.push('Falta Teléfono');
+  if (!s.aseguradora) errors.push('Falta Aseguradora');
+  if (!s.causa) errors.push('Falta Causa');
+  if (!s.fecha || s.fecha === '—') errors.push('Falta Fecha Sin.');
+  if (s.telefono && s.telefono.length < 11) errors.push('Teléfono parece incompleto');
+  return { ok: errors.length === 0, errors };
+}
+
+function readExcel(filePath) {
+  const workbook = XLSX.readFile(filePath);
+  const sheetName = workbook.SheetNames[0];
+  const sheet = workbook.Sheets[sheetName];
+  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+  console.log(`📊 Excel leído: ${rows.length} filas de "${sheetName}"`);
+
+  return rows.map(row => ({
+    nexp: String(row['Encargo'] || '').trim(),
+    fecha: formatDate(row['Fecha Sin.']),
+    causa: String(row['Causa'] || '').trim(),
+    aseguradora: String(row['Aseguradora'] || '').trim(),
+    telefono: normalizePhoneES(row['Teléfono']),
+    nombre: capitalizeName(row['Nombre']),
+    estado: String(row['Estado'] || '').trim(),
+    _raw: row
+  }));
+}
+
+async function buildVerificationTextWithAI(siniestro) {
+  const prompt = `
+Eres un asistente de un gabinete pericial. Redacta UN único mensaje en español (tono profesional y cercano)
+para verificar con el asegurado los datos del siniestro.
+
+Incluye estos datos exactamente:
+- Encargo/expediente: ${siniestro.nexp || '—'}
+- Fecha siniestro: ${siniestro.fecha || '—'}
+- Causa: ${siniestro.causa || '—'}
+- Aseguradora: ${siniestro.aseguradora || '—'}
+- Nombre: ${siniestro.nombre || '—'}
+- Teléfono: ${siniestro.telefono || '—'}
+
+Pide que responda escribiendo:
+- "Sí" si todo es correcto, o
+- que indique qué dato/s corregir (por ejemplo: "La fecha es...", "Mi nombre es...", etc.)
+
+Añade también (en una sola frase) que si prefiere hablar con un perito, que lo indique y se le contactará.
+No uses JSON, no pongas encabezados, no uses listas largas.
+`;
+  const text = await generateResponse(prompt);
+  return String(text || '').trim();
+}
+
+async function sendInitial(siniestro) {
+  const saludo = getSaludo();
+
+  console.log(`\n📤 Enviando a ${siniestro.nombre} (${siniestro.telefono})...`);
+  console.log(`   Encargo: ${siniestro.nexp} | Causa: ${siniestro.causa} | Fecha: ${siniestro.fecha}`);
+
+  const validation = validateExcelRow(siniestro);
+
+  siniestroStore.update(siniestro.nexp, {
+    nexp: siniestro.nexp,
+    fecha_siniestro: siniestro.fecha,
+    causa: siniestro.causa,
+    aseguradora: siniestro.aseguradora,
+    telefono: siniestro.telefono,
+    nombre: siniestro.nombre,
+
+    datos_verificados: false,
+    datos_excel_ok: validation.ok,
+    errores_excel: validation.errors,
+
+    tipo_visita: null,
+    motivo_tipo_visita: null,
+    estimacion_danos: null,
+    urgencia: null,
+
+    estado: 'en_curso',
+    creado_at: new Date().toISOString(),
+    template_enviado: 'saludo',
+    message_id: null,
+
+    historial_respuestas: [],
+    datos_corregidos: null
+  });
+
+  // 1) Template saludo (posicional por orden, aunque esté catalogado como NAMED)
+  const result = await sendSaludoTemplate(
+    siniestro.telefono,
+    {
+      saludo,
+      aseguradora: siniestro.aseguradora || '—',
+      nexp: siniestro.nexp || '—',
+      causa: siniestro.causa || '—'
+    },
+    TEMPLATE_LANG
+  );
+
+  console.log(`✅ Template enviado — Message ID: ${result?.messages?.[0]?.id || '—'}`);
+
+  siniestroStore.update(siniestro.nexp, {
+    message_id: result?.messages?.[0]?.id || null
+  });
+
+  conversationManager.createOrUpdateConversation(siniestro.telefono, {
+    status: 'pending',
+    stage: 'consent',
+    attempts: 0,
+    misunderstandCount: 0,
+    lastMessageAt: Date.now(),
+    lastUserMessageAt: null,
+    createdAt: Date.now(),
+    userData: {
+      nexp: siniestro.nexp,
+      fecha: siniestro.fecha,
+      causa: siniestro.causa,
+      aseguradora: siniestro.aseguradora,
+      telefono: siniestro.telefono,
+      nombre: siniestro.nombre
+    },
+    history: []
+  });
+
+  // 2) Texto IA para verificación
+  const verificationText = await buildVerificationTextWithAI(siniestro);
+  if (verificationText) {
+    await sendTextMessage(siniestro.telefono, verificationText);
+    console.log('✅ Mensaje de verificación (IA) enviado');
+  } else {
+    console.warn('⚠️ No se generó texto IA de verificación (vacío)');
+  }
+
+  console.log(`✅ Siniestro ${siniestro.nexp}.json actualizado + conversación registrada`);
+  return result;
+}
+
+async function main() {
+  const arg = process.argv[2];
+
+  if (!arg) {
+    console.error('❌ Uso:');
+    console.error('   node src/sendInitialMessage.js <nexp>       → Enviar un siniestro');
+    console.error('   node src/sendInitialMessage.js --all        → Enviar todos (estado OK)');
+    console.error('   node src/sendInitialMessage.js --list       → Listar siniestros');
+    process.exit(1);
+  }
+
+  let siniestros;
+  try {
+    siniestros = readExcel(EXCEL_PATH);
+  } catch (error) {
+    console.error(`❌ Error leyendo Excel (${EXCEL_PATH}):`, error.message);
+    console.log('💡 Instala xlsx: npm install xlsx');
+    process.exit(1);
+  }
+
+  if (siniestros.length === 0) {
+    console.log('⚠️  El Excel está vacío');
     process.exit(0);
-  })
-  .catch((error) => {
-    console.error('💥 El script finalizó con errores\n');
+  }
+
+  if (arg === '--list') {
+    console.log('\n📋 Siniestros:\n');
+    siniestros.forEach((s, i) => {
+      console.log(`  ${i + 1}. [${s.nexp}] ${s.nombre} — ${s.causa} — Tel: ${s.telefono} — ${s.estado}`);
+    });
+    process.exit(0);
+  }
+
+  if (arg === '--all') {
+    const pendientes = siniestros.filter(s => String(s.estado || '').toUpperCase() === 'OK');
+    console.log(`\n📤 Enviando a ${pendientes.length} siniestros...\n`);
+
+    let ok = 0, fail = 0;
+    for (const s of pendientes) {
+      try {
+        await sendInitial(s);
+        ok++;
+        await new Promise(r => setTimeout(r, 2000));
+      } catch (e) {
+        fail++;
+      }
+    }
+
+    console.log(`\n📊 Resultado: ${ok} enviados, ${fail} errores`);
+    process.exit(fail > 0 ? 1 : 0);
+  }
+
+  const siniestro = siniestros.find(s => s.nexp === arg);
+  if (!siniestro) {
+    console.error(`❌ No se encontró encargo "${arg}"`);
+    console.log('💡 Disponibles:', siniestros.map(s => s.nexp).join(', '));
+    process.exit(1);
+  }
+
+  await sendInitial(siniestro);
+}
+
+main()
+  .then(() => process.exit(0))
+  .catch(error => {
+    console.error('💥', error?.response?.data || error.message);
     process.exit(1);
   });

@@ -1,468 +1,564 @@
-// src/bot/messageHandler.js (VERSIÓN MEJORADA)
+// src/bot/messageHandler.js — v6
+// Flujo completo con persistencia de JSON por siniestro (data/siniestros/{nexp}.json)
+//
+// Importante: Solo el primer contacto va por plantilla (sendInitialMessage.js).
+// El resto de mensajes se envían como texto generado por IA (Gemini), y el asegurado responde escribiendo.
+//
+// Paso 1: Verificar datos del siniestro con el asegurado
+// Paso 2: Clasificar causa → decidir presencial o pedir horquilla/importe de daños
+// Paso 3: IA decide urgencia (silencioso)
+// Paso 4: Mensaje final
+//
 const conversationManager = require('./conversationManager');
-const { 
-  generateResponse, 
-  analyzeMessage, 
-  validateUserInput,
-  determineNextStage,
-  CONVERSATION_FLOW 
-} = require('../ai/aiModel');
-const { normalizeWhatsAppNumber } = require('./utils/phone');
+const siniestroStore = require('./siniestroStore');
+const responses = require('./responses');
+const { analyzeUrgency, generateResponse } = require('../ai/aiModel');
 
-/**
- * Modo de operación del bot
- */
-const BOT_MODE = process.env.BOT_MODE || 'ai';
+// ── Configuración ────────────────────────────────────────────────────────
+const DAMAGE_THRESHOLD = Number(process.env.DAMAGE_THRESHOLD || 5000);
+const MAX_MISUNDERSTAND = Number(process.env.MAX_MISUNDERSTAND_ATTEMPTS || 2);
 
-/**
- * Procesa mensajes del usuario con IA mejorada
- */
+// Causas que OBLIGAN visita presencial (según requisito)
+function isPresencialOnlyByCause(causaRaw) {
+  const c = String(causaRaw || '').toLowerCase();
+
+  // Sobretensión por compañía de la luz
+  const sobretension = c.includes('sobretensión') || c.includes('sobretension');
+  const companiaLuz = /(compa[nñ]i?a|compania|luz|compa[nñ]ia de la luz)/i.test(c);
+  if (sobretension && companiaLuz) return { yes: true, motivo: 'Sobretensión por compañía de la luz' };
+
+  // Robo con sustracción (o robo/hurto/expoliación/sustracción)
+  if (/(robo|hurto|expoliaci[oó]n|sustracci[oó]n)/i.test(c)) {
+    return { yes: true, motivo: 'Robo / Hurto / Expoliación / Sustracción' };
+  }
+
+  // RC / Responsabilidad civil
+  if (/\brc\b/i.test(c) || /responsabilidad\s+civil/i.test(c)) {
+    return { yes: true, motivo: 'Responsabilidad civil (RC)' };
+  }
+
+  // Lesiones
+  if (/lesion/i.test(c)) {
+    return { yes: true, motivo: 'Lesiones' };
+  }
+
+  return { yes: false, motivo: null };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ENTRY POINT
+// ═══════════════════════════════════════════════════════════════════════════
 async function processMessage(incomingMessage, senderNumber) {
-  senderNumber = normalizeWhatsAppNumber(senderNumber) || senderNumber;
+  let conv = conversationManager.getConversation(senderNumber);
 
-  let conversation = conversationManager.getConversation(senderNumber);
-  if (!conversation) {
-    conversation = conversationManager.createOrUpdateConversation(senderNumber, {
-      stage: 'initial',
-      status: 'pending',
+  if (!conv) {
+    conv = conversationManager.createOrUpdateConversation(senderNumber, {
+      stage: 'consent',
+      status: 'new',
+      userData: {},
       attempts: 0,
+      misunderstandCount: 0,
       history: [],
-      createdAt: Date.now(),
-      userData: {}
     });
   }
 
-  // Registrar mensaje del usuario
+  const msg = (incomingMessage || '').trim();
+  const msgLower = msg.toLowerCase();
+  const nexp = conv.userData?.nexp || null;
+
+  console.log('\n┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+  console.log(`┃ 📬 Mensaje: "${msg}"`);
+  console.log(`┃ 📊 Stage: ${conv.stage} | Nexp: ${nexp || '—'}`);
+  console.log(`┃ 👤 ${senderNumber}`);
+  console.log('┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+
   conversationManager.recordUserMessage(senderNumber);
 
-  console.log('\n┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log('📬 Mensaje recibido:', incomingMessage);
-  console.log('📊 Estado actual:', conversation.stage, '/', conversation.status);
-  console.log('🤖 Modo operación:', BOT_MODE);
-  console.log('👤 Usuario:', senderNumber);
-  console.log('🕐 Timestamp:', new Date().toISOString());
-  console.log('┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
+  // ── Quiere hablar con humano (aplica en cualquier stage) ──
+  if (wantsHuman(msgLower)) {
+    return doEscalate(senderNumber, conv, msg, 'Usuario solicitó hablar con un perito/persona');
+  }
 
-  try {
-    // PASO 1: Analizar el mensaje con IA
-    console.log('🔍 PASO 1: Analizando mensaje...');
-    const analysis = await analyzeMessage(incomingMessage);
-    console.log('   Intent:', analysis.intent);
-    console.log('   Sentiment:', analysis.sentiment);
-    console.log('   Needs Human:', analysis.needsHumanSupport);
-    console.log('   Confidence:', analysis.confidence);
+  // ── Router por stage ──
+  switch (conv.stage) {
+    case 'consent':
+      return handleConsent(msg, msgLower, senderNumber, conv);
 
-    // PASO 2: Verificar si necesita escalación
-    if (shouldEscalate(analysis, conversation)) {
-      return handleEscalation(analysis, conversation, senderNumber);
-    }
+    case 'verify_data':
+      return handleVerifyData(msg, msgLower, senderNumber, conv);
 
-    // PASO 3: Extraer y validar datos si corresponde
-    console.log('\n🔍 PASO 2: Extrayendo datos...');
-    const extractedData = await extractRelevantData(incomingMessage, conversation, analysis);
-    
-    if (Object.keys(extractedData).length > 0) {
-      console.log('   Datos extraídos:', extractedData);
-      conversation.userData = { ...conversation.userData, ...extractedData };
-    }
+    case 'correct_data':
+      return handleCorrectData(msg, msgLower, senderNumber, conv);
 
-    // PASO 4: Determinar si avanzar de etapa
-    console.log('\n➡️  PASO 3: Evaluando transición de stage...');
-    const shouldProgress = evaluateStageProgression(analysis, conversation);
-    
-    let newStage = conversation.stage;
-    if (shouldProgress) {
-      newStage = determineNextStage(conversation.stage, analysis.intent, conversation.userData);
-      console.log(`   ✅ Transición aprobada: ${conversation.stage} → ${newStage}`);
-    } else {
-      console.log(`   ⏸️  Permanece en: ${conversation.stage}`);
-    }
+    case 'classify_cause':
+      return doClassifyCause(senderNumber, conv);
 
-    // PASO 5: Generar respuesta con IA
-    console.log('\n🤖 PASO 4: Generando respuesta con Gemini...');
-    const context = buildContext(conversation, analysis, extractedData);
-    const response = await generateResponse(incomingMessage, context);
+    case 'estimate_damage':
+      return handleEstimateDamage(msg, msgLower, senderNumber, conv);
 
-    // PASO 6: Actualizar estado de la conversación
-    console.log('\n💾 PASO 5: Actualizando estado...');
-    updateConversationState(
-      senderNumber,
-      {
-        stage: newStage,
-        status: 'responded',
-        userData: conversation.userData,
-        lastIntent: analysis.intent,
-        lastSentiment: analysis.sentiment,
-        lastConfidence: analysis.confidence,
-        attempts: shouldProgress ? 0 : (conversation.attempts || 0) + 1
-      },
-      incomingMessage,
-      response
-    );
+    case 'completed':
+    case 'farewell':
+    case 'closed':
+      return responses.conversacionFinalizada;
 
-    console.log('✅ Procesamiento completado');
-    console.log('   New stage:', newStage);
-    console.log('   Response length:', response.length);
-    console.log('');
+    case 'escalated':
+      return responses.yaEscalado;
 
-    return response;
-
-  } catch (error) {
-    console.error('❌ Error procesando mensaje:', error);
-    console.error('Stack:', error.stack);
-    
-    return handleError(error, conversation, senderNumber);
+    default:
+      console.warn('⚠️  Stage desconocido:', conv.stage);
+      return doEscalate(senderNumber, conv, msg, 'Stage desconocido');
   }
 }
 
-/**
- * Construye el contexto completo para la IA
- */
-function buildContext(conversation, analysis, extractedData) {
-  const stageConfig = CONVERSATION_FLOW[conversation.stage];
-  
-  return {
-    phoneNumber: conversation.phoneNumber,
-    status: conversation.status,
-    stage: conversation.stage,
-    stageName: stageConfig?.name || conversation.stage,
-    history: conversation.history || [],
-    userData: {
-      ...conversation.userData,
-      ...extractedData
-    },
-    metadata: {
-      attempts: conversation.attempts || 0,
-      offTopicCount: conversation.offTopicCount || 0,
-      frustrationDetected: conversation.frustrationDetected || false,
-      needsAssistance: conversation.needsAssistance || false,
-      createdAt: conversation.createdAt,
-      lastMessageAt: conversation.lastMessageAt,
-      lastIntent: conversation.lastIntent,
-      lastSentiment: conversation.lastSentiment
-    },
-    analysis: analysis
-  };
+// ═══════════════════════════════════════════════════════════════════════════
+// PASO 1 — VERIFICAR DATOS
+// ═══════════════════════════════════════════════════════════════════════════
+async function handleConsent(msg, msgLower, senderNumber, conv) {
+  const nexp = conv.userData?.nexp;
+
+  // ✅ Datos correctos
+  if (isAffirmative(msgLower)) {
+    logRespuesta(nexp, 'consent', 'Verificación de datos', msg);
+    persistSiniestro(nexp, { datos_verificados: true, estado: 'en_curso' });
+    saveConv(senderNumber, { stage: 'classify_cause', misunderstandCount: 0 }, msg);
+    return doClassifyCause(senderNumber, conv);
+  }
+
+  // ❌ Datos incorrectos
+  if (wantsCorrection(msgLower)) {
+    logRespuesta(nexp, 'consent', 'Verificación de datos', msg);
+    persistSiniestro(nexp, { datos_verificados: false, estado: 'en_curso' });
+    saveConv(senderNumber, { stage: 'correct_data', misunderstandCount: 0 }, msg);
+    return aiText('pedirDatosCorregidos', conv.userData);
+  }
+
+  // 🚫 No es el asegurado
+  if (notInsured(msgLower)) {
+    logRespuesta(nexp, 'consent', 'Verificación de datos', msg);
+    persistSiniestro(nexp, { estado: 'cerrado_no_asegurado' });
+    saveConv(senderNumber, { stage: 'closed', status: 'closed' }, msg);
+    return aiText('noEsAsegurado', conv.userData);
+  }
+
+  // 🤷 No entendemos
+  return doMisunderstand(senderNumber, conv, msg, await aiText('reformularConsent', conv.userData));
 }
 
-/**
- * Extrae datos relevantes según la etapa actual
- */
-async function extractRelevantData(message, conversation, analysis) {
-  const stage = conversation.stage;
-  const extracted = {};
+async function handleVerifyData(msg, msgLower, senderNumber, conv) {
+  const nexp = conv.userData?.nexp;
 
-  // Ya vienen algunos datos del análisis de IA
-  if (analysis.extractedData) {
-    Object.assign(extracted, analysis.extractedData);
+  if (isAffirmative(msgLower)) {
+    logRespuesta(nexp, 'verify_data', 'Re-verificación tras corrección', msg);
+    persistSiniestro(nexp, { datos_verificados: true, estado: 'en_curso' });
+    saveConv(senderNumber, { stage: 'classify_cause', misunderstandCount: 0 }, msg);
+    return doClassifyCause(senderNumber, conv);
   }
 
-  // Extracciones específicas por etapa
-  try {
-    switch (stage) {
-      case 'awaiting_corrections':
-        // Validar y extraer correcciones
-        if (message.toLowerCase().includes('direccion') || message.toLowerCase().includes('dirección')) {
-          const validation = await validateUserInput(message, 'direccion');
-          if (validation.isValid) {
-            extracted.correctedDireccion = validation.extractedData;
-          }
-        }
-        if (message.toLowerCase().includes('fecha')) {
-          const validation = await validateUserInput(message, 'fecha');
-          if (validation.isValid) {
-            extracted.correctedFecha = validation.extractedData;
-          }
-        }
-        if (message.toLowerCase().includes('nombre')) {
-          const validation = await validateUserInput(message, 'nombre');
-          if (validation.isValid) {
-            extracted.correctedNombre = validation.extractedData;
-          }
-        }
-        break;
-
-      case 'attendee_select':
-        const normalized = message.toLowerCase().trim();
-        if (normalized.includes('yo') || normalized.includes('mi') || normalized.includes('estaré')) {
-          extracted.attendee = 'self';
-          extracted.attendeeLabel = 'El asegurado/a';
-        } else if (normalized.includes('otra persona') || normalized.includes('alguien')) {
-          extracted.attendee = 'other';
-          extracted.attendeeLabel = 'Otra persona';
-        }
-        break;
-
-      case 'other_person_details':
-        // Extraer nombre y teléfono
-        const nameValidation = await validateUserInput(message, 'nombre');
-        const phoneValidation = await validateUserInput(message, 'telefono');
-        
-        if (nameValidation.isValid) {
-          extracted.otherPersonName = nameValidation.extractedData;
-        }
-        if (phoneValidation.isValid) {
-          extracted.otherPersonPhone = phoneValidation.extractedData;
-        }
-        
-        if (extracted.otherPersonName && extracted.otherPersonPhone) {
-          extracted.otherPersonDetails = `${extracted.otherPersonName} - ${extracted.otherPersonPhone}`;
-        }
-        break;
-
-      case 'claim_type':
-        // Detectar tipo de siniestro
-        const msg = message.toLowerCase();
-        if (msg.includes('agua') || msg.includes('inundación') || msg.includes('inundacion')) {
-          extracted.claimType = 'water_damage';
-          extracted.claimTypeLabel = 'Daños por agua';
-        } else if (msg.includes('incendio') || msg.includes('fuego')) {
-          extracted.claimType = 'fire';
-          extracted.claimTypeLabel = 'Incendio';
-        } else if (msg.includes('robo') || msg.includes('hurto')) {
-          extracted.claimType = 'theft';
-          extracted.claimTypeLabel = 'Robo';
-        } else if (msg.includes('cristal') || msg.includes('ventana')) {
-          extracted.claimType = 'glass';
-          extracted.claimTypeLabel = 'Rotura de cristales';
-        } else {
-          extracted.claimType = 'other';
-          extracted.claimTypeLabel = message.substring(0, 50);
-        }
-        break;
-
-      case 'severity':
-        const severity = message.toLowerCase();
-        if (severity.includes('leve') || severity.includes('menor') || severity.includes('pequeño')) {
-          extracted.severity = 'leve';
-          extracted.severityLabel = 'Leve';
-        } else if (severity.includes('moderado') || severity.includes('medio')) {
-          extracted.severity = 'moderado';
-          extracted.severityLabel = 'Moderado';
-        } else if (severity.includes('grave') || severity.includes('serio') || severity.includes('importante')) {
-          extracted.severity = 'grave';
-          extracted.severityLabel = 'Grave';
-        }
-        break;
-
-      case 'appointment_mode':
-        const mode = message.toLowerCase();
-        if (mode.includes('presencial') || mode.includes('persona') || mode.includes('visita')) {
-          extracted.appointmentMode = 'presencial';
-        } else if (mode.includes('telemática') || mode.includes('telematica') || mode.includes('video') || mode.includes('llamada')) {
-          extracted.appointmentMode = 'telematica';
-        }
-        break;
-
-      case 'preferred_date':
-        const dateValidation = await validateUserInput(message, 'fecha_cita');
-        if (dateValidation.isValid) {
-          extracted.preferredDate = dateValidation.extractedData;
-          extracted.preferredDateNormalized = dateValidation.normalizedData;
-        }
-        break;
-    }
-  } catch (error) {
-    console.error('⚠️  Error extrayendo datos:', error.message);
+  if (isNegative(msgLower) || wantsCorrection(msgLower)) {
+    logRespuesta(nexp, 'verify_data', 'Re-verificación tras corrección', msg);
+    saveConv(senderNumber, { stage: 'correct_data', misunderstandCount: 0 }, msg);
+    return aiText('pedirDatosCorregidos', conv.userData);
   }
 
-  return extracted;
+  return doMisunderstand(senderNumber, conv, msg, await aiText('reformularVerify', conv.userData));
 }
 
-/**
- * Evalúa si debe progresar a la siguiente etapa
- */
-function evaluateStageProgression(analysis, conversation) {
-  const stage = conversation.stage;
-  const intent = analysis.intent;
-  
-  // Reglas por etapa
-  const progressionRules = {
-    initial: () => {
-      return intent === 'confirmar_datos' || intent === 'corregir_datos';
-    },
-    awaiting_corrections: () => {
-      return intent === 'proporcionar_informacion' && conversation.userData?.correctedDireccion;
-    },
-    initial_confirm: () => {
-      return intent === 'confirmar_datos';
-    },
-    attendee_select: () => {
-      return conversation.userData?.attendee !== undefined;
-    },
-    other_person_details: () => {
-      return conversation.userData?.otherPersonDetails !== undefined;
-    },
-    claim_type: () => {
-      return conversation.userData?.claimType !== undefined;
-    },
-    severity: () => {
-      return conversation.userData?.severity !== undefined;
-    },
-    appointment_mode: () => {
-      return conversation.userData?.appointmentMode !== undefined;
-    },
-    preferred_date: () => {
-      return conversation.userData?.preferredDate !== undefined;
-    },
-    final_confirmation: () => {
-      return intent === 'confirmar_datos';
-    }
-  };
+async function handleCorrectData(msg, msgLower, senderNumber, conv) {
+  const nexp = conv.userData?.nexp;
+  const corrections = parseCorrections(msg);
+  const userData = { ...(conv.userData || {}), ...corrections };
 
-  const rule = progressionRules[stage];
-  if (!rule) return false;
+  // Guardar correcciones
+  logRespuesta(nexp, 'correct_data', 'Corrección de datos', msg);
 
-  const shouldProgress = rule();
-  console.log(`   Evaluación progresión (${stage}):`, shouldProgress);
-  
-  return shouldProgress;
-}
-
-/**
- * Determina si debe escalar a humano
- */
-function shouldEscalate(analysis, conversation) {
-  // Escalación explícita
-  if (analysis.needsHumanSupport) {
-    console.log('⚠️  Escalación: Usuario solicitó soporte humano');
-    return true;
-  }
-
-  // Sentimiento muy negativo con alta confianza
-  if (analysis.sentiment === 'negativo' && analysis.confidence > 0.8) {
-    console.log('⚠️  Escalación: Sentimiento muy negativo');
-    return true;
-  }
-
-  // Usuario frustrado repetidamente
-  if (conversation.frustrationDetected && (conversation.offTopicCount || 0) >= 2) {
-    console.log('⚠️  Escalación: Usuario frustrado con múltiples intentos');
-    return true;
-  }
-
-  // Muchos intentos sin progreso en la misma etapa
-  if ((conversation.attempts || 0) >= 4 && conversation.stage === conversation.prevStage) {
-    console.log('⚠️  Escalación: 4+ intentos sin progreso');
-    return true;
-  }
-
-  // Confusión persistente
-  if (analysis.intent === 'confundido' && (conversation.attempts || 0) >= 2) {
-    console.log('⚠️  Escalación: Usuario confundido persistentemente');
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * Maneja la escalación a humano
- */
-function handleEscalation(analysis, conversation, senderNumber) {
-  console.log('🚨 Escalando conversación a agente humano...');
-  
-  const reason = analysis.needsHumanSupport 
-    ? 'Usuario solicitó soporte humano'
-    : analysis.sentiment === 'negativo'
-    ? 'Sentimiento negativo detectado'
-    : analysis.intent === 'confundido'
-    ? 'Usuario confundido'
-    : 'Usuario frustrado o sin progreso';
-
-  conversationManager.createOrUpdateConversation(senderNumber, {
-    status: 'escalated',
-    stage: 'escalated',
-    escalatedAt: Date.now(),
-    escalationReason: reason,
-    escalationDetails: {
-      lastIntent: analysis.intent,
-      lastSentiment: analysis.sentiment,
-      attempts: conversation.attempts,
-      stage: conversation.stage
-    }
+  // Actualizamos también los campos principales del JSON (para que queden consistentes)
+  persistSiniestro(nexp, {
+    datos_corregidos: corrections,
+    nexp: userData.nexp || nexp,
+    fecha_siniestro: userData.fecha || userData.fecha_siniestro,
+    causa: userData.causa,
+    aseguradora: userData.aseguradora,
+    telefono: userData.telefono,
+    nombre: userData.nombre,
   });
 
-  // Respuestas personalizadas según el motivo
-  if (analysis.sentiment === 'negativo') {
-    return 'Lamento mucho las molestias. Voy a transferirle con un supervisor que podrá atenderle personalmente. Un momento por favor.';
-  } else if (analysis.intent === 'confundido') {
-    return 'Entiendo que puede resultar confuso. Permítame conectarle con un agente que podrá explicarle todo con más detalle. Gracias por su paciencia.';
-  } else if (conversation.frustrationDetected) {
-    return 'Comprendo su frustración. Le pongo en contacto directo con un miembro de nuestro equipo que podrá ayudarle mejor. Disculpe las molestias.';
-  } else {
-    return 'Por supuesto, le conecto con un agente de nuestro equipo que le atenderá personalmente en breve. Gracias.';
-  }
+  // Pedimos re-verificación
+  saveConv(senderNumber, { stage: 'verify_data', userData, misunderstandCount: 0 }, msg);
+
+  const resumen = buildDataSummary(userData);
+  return aiText('confirmarDatosCorregidos', { ...userData, resumen });
 }
 
-/**
- * Actualiza el estado de la conversación
- */
-function updateConversationState(senderNumber, updates, userMessage, botResponse) {
-  const history = conversationManager.getConversation(senderNumber)?.history || [];
-  
-  // Agregar al historial
-  history.push(
-    { role: 'user', content: userMessage, timestamp: Date.now() },
-    { role: 'assistant', content: botResponse, timestamp: Date.now() }
+// ═══════════════════════════════════════════════════════════════════════════
+// PASO 2 — CLASIFICAR CAUSA
+// ═══════════════════════════════════════════════════════════════════════════
+async function doClassifyCause(senderNumber, conv) {
+  const freshConv = conversationManager.getConversation(senderNumber) || conv;
+  const causaRaw = freshConv.userData?.causa || '';
+  const nexp = freshConv.userData?.nexp;
+
+  console.log(`🔍 Clasificando causa: "${String(causaRaw)}"`);
+
+  const { yes: presencialOnly, motivo } = isPresencialOnlyByCause(causaRaw);
+
+  if (presencialOnly) {
+    console.log('🏠 → Presencial obligatoria por tipo de causa');
+
+    // Paso 3: urgencia silenciosa
+    const urgency = await analyzeUrgency(freshConv.userData || {});
+
+    persistSiniestro(nexp, {
+      tipo_visita: 'presencial',
+      motivo_tipo_visita: 'Causa requiere visita presencial',
+      estimacion_danos: null,
+      urgencia: {
+        urgente: urgency.urgente,
+        motivo: urgency.motivo,
+      },
+      estado: 'completado',
+      completado_at: new Date().toISOString(),
+      clasificacion: { motivo_presencial: motivo || 'Causa requiere visita presencial' },
+    });
+
+    saveConv(senderNumber, { stage: 'completed', status: 'completed' }, '[AUTO_PRESENCIAL]');
+    return aiText('finalPresencialPorCausa', freshConv.userData);
+  }
+
+  // No es presencial obligatoria → pedir estimación/horquilla
+  console.log('💰 → Pedir estimación de daños');
+
+  saveConv(senderNumber, { stage: 'estimate_damage', misunderstandCount: 0 }, '[AUTO]');
+  return aiText('pedirEstimacionDanos', freshConv.userData);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// PASO 2b — ESTIMACIÓN DE DAÑOS → DIGITAL o PRESENCIAL
+// ═══════════════════════════════════════════════════════════════════════════
+async function handleEstimateDamage(msg, msgLower, senderNumber, conv) {
+  const estimate = extractDamageEstimate(msg);
+  const nexp = conv.userData?.nexp;
+
+  if (!estimate) {
+    return doMisunderstand(senderNumber, conv, msg, await aiText('reformularEstimacion', conv.userData));
+  }
+
+  logRespuesta(nexp, 'estimate_damage', 'Estimación de daños económicos', msg);
+
+  // Para el umbral usamos una referencia conservadora: si es rango, el máximo; si es importe, el importe.
+  const reference = estimate.tipo === 'rango' ? estimate.max : estimate.importe;
+  const isPresencial = reference > DAMAGE_THRESHOLD;
+  const tipoVisita = isPresencial ? 'presencial' : 'digital';
+
+  console.log(`💰 Estimación: ref=${reference}€ (umbral: ${DAMAGE_THRESHOLD}€) → ${tipoVisita.toUpperCase()}`);
+
+  const freshConv = conversationManager.getConversation(senderNumber) || conv;
+
+  // Paso 3: urgencia silenciosa
+  const urgency = await analyzeUrgency({ ...(freshConv.userData || {}), estimacion_danos: estimate });
+
+  // Persistimos estimación con formato “horquilla”
+  const estimacion_danos =
+    estimate.tipo === 'rango'
+      ? {
+          tipo: 'rango',
+          min: estimate.min,
+          max: estimate.max,
+          referencia: reference,
+          respuesta_original: msg,
+          umbral: DAMAGE_THRESHOLD,
+          supera_umbral: isPresencial,
+        }
+      : {
+          tipo: 'importe',
+          referencia: reference,
+          importe: estimate.importe,
+          respuesta_original: msg,
+          umbral: DAMAGE_THRESHOLD,
+          supera_umbral: isPresencial,
+        };
+
+  persistSiniestro(nexp, {
+    estimacion_danos,
+    tipo_visita: tipoVisita,
+    motivo_tipo_visita: isPresencial
+      ? `Estimación supera ${DAMAGE_THRESHOLD}€`
+      : `Estimación no supera ${DAMAGE_THRESHOLD}€ — cita digital posible`,
+    urgencia: { urgente: urgency.urgente, motivo: urgency.motivo },
+    estado: 'completado',
+    completado_at: new Date().toISOString(),
+  });
+
+  saveConv(senderNumber, { stage: 'completed', status: 'completed', misunderstandCount: 0 }, msg);
+
+  // Paso 4: Mensaje final
+  if (isPresencial) return aiText('finalPresencialPorImporte', { ...freshConv.userData, estimacion_danos });
+  return aiText('finalDigital', { ...freshConv.userData, estimacion_danos });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// ESCALACIÓN
+// ═══════════════════════════════════════════════════════════════════════════
+function doEscalate(senderNumber, conv, msg, reason) {
+  console.log(`🚨 Escalando: ${reason}`);
+  const nexp = conv.userData?.nexp;
+
+  logRespuesta(nexp, conv.stage, 'Escalación', msg);
+  persistSiniestro(nexp, {
+    estado: 'escalado',
+    escalacion: {
+      motivo: reason,
+      stage_al_escalar: conv.stage,
+      escalado_at: new Date().toISOString(),
+    },
+  });
+
+  saveConv(
+    senderNumber,
+    {
+      stage: 'escalated',
+      status: 'escalated',
+      escalatedAt: Date.now(),
+      escalationReason: reason,
+    },
+    msg
   );
 
-  // Mantener solo últimos 30 mensajes
-  const trimmedHistory = history.slice(-30);
-
-  // Actualizar
-  conversationManager.createOrUpdateConversation(senderNumber, {
-    ...updates,
-    history: trimmedHistory,
-    lastResponseAt: Date.now(),
-    prevStage: conversationManager.getConversation(senderNumber)?.stage
-  });
-
-  console.log('💾 Estado actualizado:', {
-    stage: updates.stage,
-    status: updates.status,
-    attempts: updates.attempts,
-    historySize: trimmedHistory.length
-  });
+  return aiText('escalacion', conv.userData);
 }
 
-/**
- * Manejo de errores
- */
-function handleError(error, conversation, senderNumber) {
-  console.error('🔥 Error crítico en processMessage');
-  console.error('   Error:', error.message);
-  console.error('   Stage:', conversation?.stage);
-  console.error('   User:', senderNumber);
+// ═══════════════════════════════════════════════════════════════════════════
+// NO ENTENDEMOS → REINTENTAR o ESCALAR
+// ═══════════════════════════════════════════════════════════════════════════
+async function doMisunderstand(senderNumber, conv, msg, retryMessage) {
+  const count = (conv.misunderstandCount || 0) + 1;
 
-  // Registrar el error
-  conversationManager.createOrUpdateConversation(senderNumber, {
-    lastError: {
-      message: error.message,
-      stage: conversation?.stage,
-      timestamp: Date.now()
-    },
-    errorCount: (conversation?.errorCount || 0) + 1
-  });
-
-  // Si hay muchos errores, escalar
-  if ((conversation?.errorCount || 0) >= 3) {
-    conversationManager.createOrUpdateConversation(senderNumber, {
-      status: 'escalated',
-      stage: 'escalated',
-      escalatedAt: Date.now(),
-      escalationReason: 'Múltiples errores técnicos'
-    });
-    return 'Disculpe, estamos experimentando problemas técnicos. Voy a ponerle en contacto con un agente humano que podrá ayudarle. Gracias por su paciencia.';
+  if (count >= MAX_MISUNDERSTAND) {
+    return doEscalate(senderNumber, conv, msg, `No se pudo entender al usuario tras ${count} intentos`);
   }
 
-  // Respuesta de error genérica
-  return 'Disculpe, estoy teniendo un problema técnico momentáneo. ¿Podría reformular su mensaje o intentarlo de nuevo en unos segundos?';
+  const nexp = conv.userData?.nexp;
+  logRespuesta(nexp, conv.stage, 'Mensaje no entendido', msg);
+
+  saveConv(senderNumber, { misunderstandCount: count }, msg);
+  return retryMessage;
 }
 
-module.exports = {
-  processMessage,
-  handleEscalation,
-  updateConversationState,
-  handleError
-};
+// ═══════════════════════════════════════════════════════════════════════════
+// HELPERS DE PERSISTENCIA
+// ═══════════════════════════════════════════════════════════════════════════
+function persistSiniestro(nexp, data) {
+  if (!nexp) return;
+  siniestroStore.update(nexp, data);
+}
+
+function logRespuesta(nexp, stage, pregunta, respuesta) {
+  if (!nexp) return;
+  siniestroStore.addRespuesta(nexp, stage, pregunta, respuesta);
+}
+
+function saveConv(senderNumber, updates, userMsg) {
+  const conv = conversationManager.getConversation(senderNumber) || {};
+  const history = conv.history || [];
+
+  if (userMsg && userMsg !== '[AUTO]' && !String(userMsg).startsWith('[AUTO_')) {
+    history.push({ role: 'user', content: userMsg, timestamp: Date.now() });
+  }
+
+  conversationManager.createOrUpdateConversation(senderNumber, {
+    ...updates,
+    history: history.slice(-30),
+    lastResponseAt: Date.now(),
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// IA: generación de textos por stage (con fallback a responses fijos)
+// ═══════════════════════════════════════════════════════════════════════════
+async function aiText(kind, ctx = {}) {
+  const base = {
+    nexp: ctx.nexp,
+    fecha_siniestro: ctx.fecha || ctx.fecha_siniestro,
+    causa: ctx.causa,
+    aseguradora: ctx.aseguradora,
+    nombre: ctx.nombre,
+    telefono: ctx.telefono,
+  };
+
+  const prompts = {
+    noEsAsegurado: `Redacta un mensaje breve en español disculpándote porque la persona indica que no es el asegurado. Despídete.`,
+    pedirDatosCorregidos: `Pide en español que indique qué datos son incorrectos y que los corrija en un solo mensaje. Da un ejemplo con Nombre, Teléfono y Fecha.`,
+    confirmarDatosCorregidos: `Confirma los datos actualizados y pregunta si ahora son correctos. Incluye este resumen:\n\n${ctx.resumen || ''}`,
+    reformularConsent: `No has entendido. Pide que responda escribiendo: "Sí" (datos correctos), "No" (hay errores) o "No soy el asegurado".`,
+    reformularVerify: `Pide confirmar si los datos actualizados son correctos. Que responda escribiendo "Sí" o "No".`,
+    pedirEstimacionDanos: `Pide una estimación aproximada de los daños en euros. Indica que puede responder con un importe (ej. 2000) o un rango (ej. 1000-3000).`,
+    reformularEstimacion: `No has podido identificar el importe. Pide que lo indique con un número en euros (por ejemplo 3000€ o 1000-3000€).`,
+    escalacion: `Indica en español que un perito se pondrá en contacto directamente para continuar, y agradece su paciencia.`,
+    finalPresencialPorCausa: `Redacta un mensaje final: agradece la atención, indica que la visita será presencial por el tipo de siniestro y que un perito contactará para concertar cita. Despídete.`,
+    finalPresencialPorImporte: `Redacta un mensaje final: agradece la atención, indica que por la estimación de daños la visita será presencial y que un perito contactará para concertar cita. Despídete.`,
+    finalDigital: `Redacta un mensaje final: agradece la atención, indica que la gestión puede ser digital (videollamada) y que un perito contactará para concertar cita. Despídete.`,
+  };
+
+  const instruction = prompts[kind] || `Redacta un mensaje breve y profesional en español.`;
+
+  const prompt = `Eres un asistente de un gabinete pericial. Tono profesional y cercano. No menciones que eres IA.\n\nContexto del siniestro:\n${JSON.stringify(base, null, 2)}\n\nInstrucción:\n${instruction}\n`;
+
+  try {
+    const out = await generateResponse(prompt);
+    const t = String(out || '').trim();
+    if (t) return t;
+  } catch {
+    // fallback abajo
+  }
+
+  // fallback: respuestas fijas si existen
+  switch (kind) {
+    case 'noEsAsegurado':
+      return responses.noEsAsegurado;
+    case 'pedirDatosCorregidos':
+      return responses.pedirDatosCorregidos;
+    case 'reformularConsent':
+      return responses.reformularConsent;
+    case 'reformularVerify':
+      return responses.reformularVerify;
+    case 'pedirEstimacionDanos':
+      return responses.pedirEstimacionDanos;
+    case 'reformularEstimacion':
+      return responses.reformularEstimacion;
+    case 'escalacion':
+      return responses.escalacion;
+    case 'finalPresencialPorCausa':
+      return responses.visitaPresencial + '\n\n' + responses.despedida;
+    case 'finalPresencialPorImporte':
+      return responses.visitaPresencialPorDanos(
+        ctx?.estimacion_danos?.referencia || ctx?.estimacion_danos?.importe || DAMAGE_THRESHOLD + 1
+      ) + '\n\n' + responses.despedida;
+    case 'finalDigital':
+      return responses.visitaDigital + '\n\n' + responses.despedida;
+    default:
+      return responses.ocupado;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// UTILIDADES DE TEXTO
+// ═══════════════════════════════════════════════════════════════════════════
+function isAffirmative(t) {
+  t = t.trim();
+  return (
+    /^(s[ií]|correcto|correctos|son correctos|vale|ok|de acuerdo|afirmativo|claro|exacto|eso es|perfecto|bien|todo bien|todo correcto)$/i.test(t) ||
+    /^s[ií],?\s*(son\s+)?correctos?/i.test(t) ||
+    /^s[ií],?\s*(est[aá]n?\s+)?bien/i.test(t)
+  );
+}
+
+function isNegative(t) {
+  return /^(no|incorrecto|incorrectos|negativo|mal|están?\s+mal)$/i.test(t.trim());
+}
+
+function wantsHuman(t) {
+  return /(hablar.*(perito|persona|humano|agente))|(no\s+quiero\s+(hablar\s+con\s+)?(la\s+)?ia)|(prefer?ir[ío]?\s+.*persona)|(quiero\s+.*perito)|(llam[ae].*perito)|(atenci[oó]n\s+humana)|(agente\s+real)/i.test(t);
+}
+
+function wantsCorrection(t) {
+  return /(no\s+(est[aá]n?|son)\s+correctos?)|(hay\s+.*error)|(est[aá]n?\s+mal)|(corregir)|(cambiar\s+dato)|(no,?\s+hay\s+(un\s+)?error)/i.test(t);
+}
+
+function notInsured(t) {
+  return /(no\s+soy\s+(el|la)\s+asegurad[oa])|(no\s+es\s+mi\s+seguro)|(n[uú]mero\s+equivocado)|(se\s+(ha\s+)?equivoca)/i.test(t);
+}
+
+// Extrae estimación: rango o importe
+function extractDamageEstimate(text) {
+  const raw = String(text || '');
+  const cleaned = raw
+    .replace(/\./g, '')      // 5.000 -> 5000
+    .replace(/,/g, '.')      // 5,5 -> 5.5
+    .replace(/€/g, ' € ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Rangos: "entre 1000 y 3000" | "de 1000 a 3000" | "1000-3000"
+  let m = cleaned.match(/entre\s+(\d+(?:\.\d+)?)\s+y\s+(\d+(?:\.\d+)?)/i);
+  if (!m) m = cleaned.match(/de\s+(\d+(?:\.\d+)?)\s+a\s+(\d+(?:\.\d+)?)/i);
+  if (!m) m = cleaned.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/);
+
+  if (m) {
+    const a = Number(m[1]);
+    const b = Number(m[2]);
+    if (!Number.isNaN(a) && !Number.isNaN(b)) {
+      const min = Math.min(a, b);
+      const max = Math.max(a, b);
+      return { tipo: 'rango', min, max };
+    }
+  }
+
+  // Importe único: primer número “razonable”
+  const one = cleaned.match(/(\d+(?:\.\d+)?)\s*(?:€|euros?|eur)?/i);
+  if (one) {
+    const n = Number(one[1]);
+    if (!Number.isNaN(n)) return { tipo: 'importe', importe: n };
+  }
+
+  // Palabras (muy básico)
+  const words = {
+    'mil': 1000,
+    'dos mil': 2000,
+    'tres mil': 3000,
+    'cuatro mil': 4000,
+    'cinco mil': 5000,
+    'seis mil': 6000,
+    'siete mil': 7000,
+    'ocho mil': 8000,
+    'nueve mil': 9000,
+    'diez mil': 10000,
+    'quince mil': 15000,
+    'veinte mil': 20000,
+  };
+  const lower = raw.toLowerCase();
+  const sorted = Object.entries(words).sort((a, b) => b[0].length - a[0].length);
+  for (const [w, n] of sorted) {
+    if (lower.includes(w)) return { tipo: 'importe', importe: n };
+  }
+
+  return null;
+}
+
+function parseCorrections(text) {
+  const out = {};
+  const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
+
+  for (const l of lines) {
+    const m = l.match(/^[-•]?\s*(\w[\w\s]*?)\s*:\s*(.+)$/i);
+    if (!m) continue;
+    const k = m[1].toLowerCase().trim();
+    const v = m[2].trim();
+
+    if (k.startsWith('nom') || k.startsWith('asegurad')) out.nombre = v;
+    else if (k.startsWith('tel') || k.startsWith('móvil') || k.startsWith('movil')) out.telefono = v;
+    else if (k.includes('exp') || k.includes('encargo') || k.includes('nº') || k.includes('num')) out.nexp = v;
+    else if (k.startsWith('fec')) out.fecha = v;
+    else if (k.startsWith('caus') || k.includes('siniestro')) out.causa = v;
+    else if (k.startsWith('aseguradora') || k.includes('compañ')) out.aseguradora = v;
+    else if (k.startsWith('dir') || k.startsWith('calle')) out.direccion = v;
+  }
+
+  if (Object.keys(out).length === 0 && text.length > 0) out._texto_libre = text;
+  return out;
+}
+
+function buildDataSummary(userData) {
+  const fields = [
+    ['Encargo (Nº Exp.)', userData.nexp],
+    ['Fecha siniestro', userData.fecha || userData.fecha_siniestro],
+    ['Causa', userData.causa],
+    ['Aseguradora', userData.aseguradora],
+    ['Teléfono', userData.telefono],
+    ['Nombre', userData.nombre],
+  ];
+  return fields
+    .filter(([, v]) => v)
+    .map(([label, value]) => `- ${label}: ${value}`)
+    .join('\n');
+}
+
+module.exports = { processMessage };

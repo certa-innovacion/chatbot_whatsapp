@@ -1,11 +1,12 @@
-// index.js - META WHATSAPP API (Sin Twilio, Sin schedulers)
-require('dotenv').config();
+// index.js — META WHATSAPP API v5
+require('dotenv').config({ override: true });
 const express = require('express');
 const bodyParser = require('body-parser');
 
 const conversationManager = require('./conversationManager');
+const siniestroStore = require('./siniestroStore');
 const { processMessage } = require('./messageHandler');
-const { sendTextMessage, markMessageAsRead } = require('./sendMessage');
+const { sendTextMessage, sendTemplateMessage, markMessageAsRead } = require('./sendMessage');
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: false }));
@@ -14,245 +15,151 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 3000;
 const META_VERIFY_TOKEN = process.env.META_VERIFY_TOKEN;
 
-// Health check endpoint
+// ── Health ───────────────────────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({
-    status: 'ok',
-    service: 'WhatsApp Bot with Gemini AI - Meta API',
-    version: '3.0',
-    timestamp: new Date().toISOString(),
-    mode: process.env.BOT_MODE || 'ai',
-    provider: 'Meta WhatsApp Business API'
-  });
+  res.json({ status: 'ok', service: 'WhatsApp Bot Jumar v5', timestamp: new Date().toISOString() });
 });
 
-// Debug endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'healthy',
-    gemini: {
-      model: process.env.GEMINI_MODEL || 'not configured',
-      apiKeyConfigured: !!process.env.GEMINI_API_KEY
-    },
+    gemini: { model: process.env.GEMINI_MODEL || 'n/a', key: !!process.env.GEMINI_API_KEY },
     meta: {
-      phoneNumberId: process.env.META_PHONE_NUMBER_ID || 'not configured',
-      apiVersion: process.env.META_API_VERSION || 'not configured',
-      accessTokenConfigured: !!process.env.META_ACCESS_TOKEN
-    }
+      phoneId: process.env.META_PHONE_NUMBER_ID || 'n/a',
+      apiVersion: process.env.META_API_VERSION || 'n/a',
+      token: !!process.env.META_ACCESS_TOKEN,
+    },
   });
 });
 
-/**
- * Webhook GET - Verificación de Meta WhatsApp
- * Meta envía esta petición para verificar tu webhook
- */
+// ── Webhook GET: Verificación de Meta ────────────────────────────────────
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  console.log('\n🔐 Verificación de webhook recibida');
-  console.log('   Mode:', mode);
-  console.log('   Token recibido:', token);
-  console.log('   Token esperado:', META_VERIFY_TOKEN);
-
   if (mode === 'subscribe' && token === META_VERIFY_TOKEN) {
-    console.log('✅ Webhook verificado correctamente');
+    console.log('✅ Webhook verificado');
     res.status(200).send(challenge);
   } else {
-    console.log('❌ Token de verificación incorrecto');
     res.sendStatus(403);
   }
 });
 
-/**
- * Webhook POST - Procesar mensajes entrantes
- * Meta envía aquí todos los eventos de WhatsApp
- */
+// ── Webhook POST: Mensajes entrantes ─────────────────────────────────────
 app.post('/webhook', async (req, res) => {
-  const requestId = Date.now();
+  res.sendStatus(200); // Responder rápido a Meta
 
   try {
-    console.log('\n============================================================');
-    console.log(`📨 [${requestId}] WEBHOOK DE META WHATSAPP`);
-    console.log('============================================================');
-
     const body = req.body;
+    if (body.object !== 'whatsapp_business_account') return;
 
-    // Verificar que es una notificación de WhatsApp
-    if (body.object !== 'whatsapp_business_account') {
-      console.log('⚠️  No es una notificación de WhatsApp, ignorando');
-      return res.sendStatus(200);
-    }
+    const value = body.entry?.[0]?.changes?.[0]?.value;
+    if (!value?.messages?.length) return;
 
-    // Extraer información del mensaje
-    const entry = body.entry?.[0];
-    const changes = entry?.changes?.[0];
-    const value = changes?.value;
+    for (const message of value.messages) {
+      const from = message.from;
 
-    if (!value) {
-      console.log('⚠️  Sin datos en el webhook, ignorando');
-      return res.sendStatus(200);
-    }
+      // Marcar como leído (sin bloquear)
+      markMessageAsRead(message.id).catch(() => {});
 
-    // Verificar que hay mensajes
-    const messages = value.messages;
-    if (!messages || messages.length === 0) {
-      console.log('⚠️  Sin mensajes, probablemente es un estado de mensaje');
-      return res.sendStatus(200);
-    }
-
-    // Procesar cada mensaje (usualmente es solo 1)
-    for (const message of messages) {
-      const messageId = message.id;
-      const from = message.from; // Número del usuario (sin whatsapp:)
-      const timestamp = message.timestamp;
-      
-      console.log(`📥 [${requestId}] Mensaje recibido`);
-      console.log(`   From: ${from}`);
-      console.log(`   Message ID: ${messageId}`);
-      console.log(`   Timestamp: ${new Date(timestamp * 1000).toISOString()}`);
-
-      // Marcar mensaje como leído
-      try {
-        await markMessageAsRead(messageId);
-      } catch (error) {
-        console.error('⚠️  Error marcando mensaje como leído:', error.message);
+      // Extraer texto
+      let text = '';
+      if (message.type === 'text') text = message.text.body;
+      else if (message.type === 'button') text = message.button.text;
+      else if (message.type === 'interactive') {
+        const it = message.interactive;
+        text = it.type === 'button_reply' ? it.button_reply.title
+             : it.type === 'list_reply'   ? it.list_reply.title
+             : '';
       }
 
-      // Extraer el texto del mensaje
-      let incomingText = '';
-      
-      if (message.type === 'text') {
-        incomingText = message.text.body;
-      } else if (message.type === 'button') {
-        // Respuesta a un botón interactivo
-        incomingText = message.button.text;
-      } else if (message.type === 'interactive') {
-        // Respuesta a un mensaje interactivo
-        if (message.interactive.type === 'button_reply') {
-          incomingText = message.interactive.button_reply.title;
-        } else if (message.interactive.type === 'list_reply') {
-          incomingText = message.interactive.list_reply.title;
-        }
-      } else {
-        console.log(`⚠️  Tipo de mensaje no soportado: ${message.type}`);
-        continue;
+      if (!text?.trim()) continue;
+      console.log(`\n📥 [${from}] "${text}"`);
+
+      // Procesar
+      const reply = await processMessage(text, from);
+
+      // Enviar respuesta (una sola vez)
+      if (reply && typeof reply === 'object' && reply.type === 'template') {
+        await sendTemplateMessage(from, reply.name, reply.language || 'es', reply.components || []);
+      } else if (reply && typeof reply === 'string' && reply.length > 0) {
+        await sendTextMessage(from, reply);
       }
 
-      console.log(`💬 [${requestId}] Contenido: "${incomingText}"`);
-
-      if (!incomingText || incomingText.trim().length === 0) {
-        console.log(`⚠️  [${requestId}] Mensaje vacío, ignorando`);
-        continue;
-      }
-
-      // Actualizar timestamp del último mensaje
-      conversationManager.createOrUpdateConversation(from, {
-        phoneNumber: from,
-        lastMessageAt: Date.now(),
-        lastUserMessageAt: Date.now()
-      });
-
-      // Procesar mensaje con IA
-      console.log(`🤖 [${requestId}] Procesando con IA...`);
-      const reply = await processMessage(incomingText, from);
-
-      // Enviar respuesta
-      console.log(`📤 [${requestId}] Enviando respuesta (${reply.length} chars)...`);
-      await sendTextMessage(from, reply);
-
-      console.log(`✅ [${requestId}] Respuesta enviada correctamente`);
+      console.log(`📤 [${from}] Enviado (${typeof reply === 'string' ? reply.length + ' chars' : 'template'})`);
     }
-
-    console.log('============================================================\n');
-    
-    // IMPORTANTE: Responder 200 rápido a Meta
-    res.sendStatus(200);
-
   } catch (error) {
-    console.error(`❌ [${requestId}] Error en /webhook:`, error);
-    console.error(`   Message:`, error.message);
-    console.error(`   Stack:`, error.stack);
-    
-    // Siempre responder 200 a Meta para evitar reintentos
-    res.sendStatus(200);
+    console.error('❌ Webhook error:', error.message);
   }
 });
 
-// Endpoint para enviar mensajes manualmente (testing)
+// ── Test: enviar mensaje ─────────────────────────────────────────────────
 app.post('/send', async (req, res) => {
   try {
     const { to, message } = req.body;
-    
-    if (!to || !message) {
-      return res.status(400).json({
-        error: 'Faltan parámetros: to y message son requeridos'
-      });
-    }
-
-    console.log('📤 Enviando mensaje manual...');
-    console.log('   To:', to);
-    console.log('   Message:', message);
-
+    if (!to || !message) return res.status(400).json({ error: 'Faltan: to, message' });
     const result = await sendTextMessage(to, message);
-    
-    res.json({
-      success: true,
-      messageId: result.messages[0].id,
-      to: to
-    });
-
+    return res.json(result);
   } catch (error) {
-    console.error('❌ Error enviando mensaje:', error);
-    res.status(500).json({
-      error: error.message
+    return res.status(500).json({
+      error: error.message,
+      meta_status: error?.response?.status,
+      meta_error: error?.response?.data,
     });
   }
 });
 
-// Iniciar servidor
+// ── Ver JSON de un siniestro por nexp ────────────────────────────────────
+app.get('/siniestro/:nexp', (req, res) => {
+  const data = siniestroStore.read(req.params.nexp);
+  if (!data || !data.nexp) {
+    return res.status(404).json({ error: `Siniestro ${req.params.nexp} no encontrado` });
+  }
+  res.json(data);
+});
+
+// ── Listar todos los siniestros ──────────────────────────────────────────
+app.get('/siniestros', (req, res) => {
+  const all = siniestroStore.listAll();
+  res.json(all);
+});
+
+// ── Ver conversación por teléfono ────────────────────────────────────────
+app.get('/conversation/:phone', (req, res) => {
+  const conv = conversationManager.getConversation(req.params.phone);
+  if (!conv) return res.status(404).json({ error: 'No encontrada' });
+  res.json(conv);
+});
+
+// ── Listar conversaciones ────────────────────────────────────────────────
+app.get('/conversations', (req, res) => {
+  const all = conversationManager.getAllConversations();
+  res.json(all.map(c => ({
+    phone: c.phoneNumber,
+    stage: c.stage,
+    status: c.status,
+    nombre: c.userData?.nombre,
+    nexp: c.userData?.nexp,
+  })));
+});
+
+// ── Iniciar servidor ─────────────────────────────────────────────────────
 app.listen(PORT, () => {
   console.log('\n╔════════════════════════════════════════════════════════════╗');
-  console.log('║                                                            ║');
-  console.log('║     🤖 WhatsApp Bot with Gemini AI - Meta API v3.0        ║');
-  console.log('║                                                            ║');
+  console.log('║     🤖 WhatsApp Bot Jumar — Gabinete Pericial v5         ║');
   console.log('╚════════════════════════════════════════════════════════════╝\n');
-  
-  console.log(`✅ Servidor corriendo en puerto ${PORT}`);
-  console.log(`🤖 Modo de operación: ${process.env.BOT_MODE || 'ai'}`);
-  console.log(`🧠 Modelo Gemini: ${process.env.GEMINI_MODEL || 'gemini-3-flash-preview'}`);
-  console.log(`📞 WhatsApp Phone ID: ${process.env.META_PHONE_NUMBER_ID || 'no configurado'}`);
-  console.log(`🌐 Webhook URL: http://localhost:${PORT}/webhook`);
-  console.log(`💚 Health check: http://localhost:${PORT}/health`);
-  console.log(`🔐 Verify token: ${META_VERIFY_TOKEN || 'no configurado'}`);
+  console.log(`  ✅ Puerto: ${PORT}`);
+  console.log(`  🧠 Gemini: ${process.env.GEMINI_MODEL || 'n/a'}`);
+  console.log(`  📞 Phone ID: ${process.env.META_PHONE_NUMBER_ID || 'n/a'}`);
+  console.log(`  💰 Umbral presencial: ${process.env.DAMAGE_THRESHOLD || 5000}€`);
+  console.log(`  📁 JSONs siniestros: ${siniestroStore.SINIESTROS_DIR}`);
+  console.log(`  🌐 Webhook: http://localhost:${PORT}/webhook`);
+  console.log(`  📋 Siniestros: http://localhost:${PORT}/siniestros`);
   console.log('');
-  console.log('🔧 Provider: Meta WhatsApp Business API');
-  console.log('📝 Sin schedulers - AWS Lambda maneja colas');
-  console.log('');
-  console.log('═══════════════════════════════════════════════════════════════\n');
 });
 
-// Manejo de errores no capturados
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Unhandled Rejection at:', promise);
-  console.error('   Reason:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('❌ Uncaught Exception:', error);
-  process.exit(1);
-});
-
-// Manejo de señales de cierre
-process.on('SIGTERM', () => {
-  console.log('\n📴 Recibida señal SIGTERM, cerrando servidor...');
-  process.exit(0);
-});
-
-process.on('SIGINT', () => {
-  console.log('\n📴 Recibida señal SIGINT, cerrando servidor...');
-  process.exit(0);
-});
+process.on('unhandledRejection', (r) => console.error('❌ Unhandled:', r));
+process.on('uncaughtException', (e) => { console.error('❌ Uncaught:', e); process.exit(1); });
 
 module.exports = app;
