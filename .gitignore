@@ -10,6 +10,7 @@ node_modules/
 # Archivos de datos
 data/
 *.json
+*.xlsx
 
 # Permitir los manifests de Node aunque ignoremos *.json
 !package.json
