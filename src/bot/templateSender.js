@@ -1,8 +1,7 @@
-// src/bot/templateSender.js
-const { sendTemplateMessage } = require('./sendMessage');
-const { normalizeWhatsAppNumber } = require('./utils/phone');
+// src/bot/templateSender.js — WhatsApp Cloud API
+// Envía la plantilla "inicio" con las variables nombradas del siniestro.
 
-const TEMPLATE_NAME = process.env.WA_TPL_SALUDO;
+const adapter = require('../channels/whatsappAdapter');
 
 /**
  * Saludo por hora:
@@ -10,67 +9,58 @@ const TEMPLATE_NAME = process.env.WA_TPL_SALUDO;
  * - resto => Buenas tardes
  */
 function buildSaludoByHour(date = new Date()) {
-  const h = date.getHours();
-  return h < 12 ? 'Buenos días' : 'Buenas tardes';
+  return date.getHours() < 12 ? 'Buenos días' : 'Buenas tardes';
 }
 
 /**
- * Envía template inicial "saludo" con variables:
- * Orden (según tu plantilla):
- * 1) {{saludo}}
- * 2) {{aseguradora}}
- * 3) {{nexp}}
- * 4) {{causa}}
+ * Envía la plantilla inicial de WhatsApp al número del siniestro.
  *
- * userData (por fila excel) debe traer: aseguradora, nexp, causa
+ * La plantilla "inicio" tiene:
+ *   Header: {{saludo}}
+ *   Body:   {{aseguradora}}, {{nexp}}, {{causa}}
+ *
+ * @param {string} waId        - número WhatsApp sin + (ej. "34674742564")
+ * @param {string} templateName - nombre de la plantilla (default: 'inicio')
+ * @param {object} userData    - datos del siniestro
  */
-async function sendInitialTemplate(toNumber, templateName, userData = {}) {
-  const template = templateName || TEMPLATE_NAME;
-
-  if (!template) {
-    throw new Error('Falta nombre del template (WA_TPL_SALUDO en .env)');
-  }
-
-  // Mantengo tu normalización "whatsapp:+..." para compatibilidad con el resto del repo,
-  // pero sendMessage.js lo normaliza a formato Meta.
-  const to = normalizeWhatsAppNumber(toNumber) || toNumber;
-
-  const saludo = buildSaludoByHour();
-
-  // Soporta nombres alternativos por si el excel trae cabeceras con mayúsculas
+async function sendInitialTemplate(waId, templateName = 'inicio', userData = {}) {
+  const saludo      = buildSaludoByHour();
   const aseguradora = String(userData.aseguradora ?? userData.Aseguradora ?? '').trim();
-  const nexp = String(userData.nexp ?? userData.Encargo ?? userData.expediente ?? '').trim();
-  const causa = String(userData.causa ?? userData.Causa ?? '').trim();
+  const nexp        = String(userData.nexp ?? userData.Encargo ?? userData.expediente ?? '').trim();
+  const causaRaw    = userData.causa ?? userData.Causa ?? userData.observaciones ?? userData.Observaciones ?? '';
+  const causa       = String(causaRaw).trim().slice(0, 60);
 
   if (!aseguradora || !nexp || !causa) {
     throw new Error(
-      `Faltan variables del template. ` +
+      `Faltan variables del mensaje inicial. ` +
       `aseguradora="${aseguradora}", nexp="${nexp}", causa="${causa}"`
     );
   }
 
-  console.log('🧩 Enviando template inicial...');
-  console.log('   Template:', template);
-  console.log('   To:', to);
+  console.log('🧩 Enviando plantilla inicial WhatsApp...');
+  console.log('   Número:', waId);
+  console.log('   Template:', templateName);
   console.log('   Vars:', { saludo, aseguradora, nexp, causa });
 
-  const components = [
-    {
-      type: 'body',
-      parameters: [
-        { type: 'text', text: saludo },
-        { type: 'text', text: aseguradora },
-        { type: 'text', text: nexp },
-        { type: 'text', text: causa }
-      ]
-    }
-  ];
-
-  console.log('   Components:', JSON.stringify(components, null, 2));
-
-  return sendTemplateMessage(to, template, 'es', components);
+  return adapter.sendTemplate(waId, templateName, {
+    language: 'es',
+    components: [
+      {
+        type: 'header',
+        parameters: [
+          { type: 'text', parameter_name: 'saludo', text: saludo },
+        ],
+      },
+      {
+        type: 'body',
+        parameters: [
+          { type: 'text', parameter_name: 'aseguradora', text: aseguradora },
+          { type: 'text', parameter_name: 'nexp',        text: nexp },
+          { type: 'text', parameter_name: 'causa',       text: causa },
+        ],
+      },
+    ],
+  });
 }
 
-module.exports = {
-  sendInitialTemplate,
-};
+module.exports = { sendInitialTemplate, buildSaludoByHour };

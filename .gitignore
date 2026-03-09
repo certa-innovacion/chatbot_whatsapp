@@ -57,3 +57,6 @@ ngrok.exe
 
 # Testing
 *.test/
+
+# Conversaciones
+docs/conversations/

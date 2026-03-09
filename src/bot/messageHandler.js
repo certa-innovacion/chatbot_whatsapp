@@ -1,564 +1,335 @@
-// src/bot/messageHandler.js — v6
-// Flujo completo con persistencia de JSON por siniestro (data/siniestros/{nexp}.json)
-//
-// Importante: Solo el primer contacto va por plantilla (sendInitialMessage.js).
-// El resto de mensajes se envían como texto generado por IA (Gemini), y el asegurado responde escribiendo.
-//
-// Paso 1: Verificar datos del siniestro con el asegurado
-// Paso 2: Clasificar causa → decidir presencial o pedir horquilla/importe de daños
-// Paso 3: IA decide urgencia (silencioso)
-// Paso 4: Mensaje final
-//
+// src/bot/messageHandler.js
 const conversationManager = require('./conversationManager');
-const siniestroStore = require('./siniestroStore');
-const responses = require('./responses');
-const { analyzeUrgency, generateResponse } = require('../ai/aiModel');
+const { procesarConIA }   = require('../ai/aiModel');
+const adapter             = require('../channels/whatsappAdapter');
+const { canProcess }      = require('./stateMachine');
+const { triggerEncargoSync } = require('./peritolineAutoSync');
+const { generateConversationPdf } = require('../utils/pdfGenerator');
+const axios = require('axios');
 
-// ── Configuración ────────────────────────────────────────────────────────
-const DAMAGE_THRESHOLD = Number(process.env.DAMAGE_THRESHOLD || 5000);
-const MAX_MISUNDERSTAND = Number(process.env.MAX_MISUNDERSTAND_ATTEMPTS || 2);
+// Mapeo entre los valores que devuelve la IA y los stages internos
+const ESTADO_IA_TO_STAGE = {
+  finalizado:      'finalizado',
+  escalado_humano: 'escalated',
+};
 
-// Causas que OBLIGAN visita presencial (según requisito)
-function isPresencialOnlyByCause(causaRaw) {
-  const c = String(causaRaw || '').toLowerCase();
+// Cache de CP → localidad para no repetir peticiones
+const cpCache = {};
+const RELATION_RE = /\b(?:mi|su)\s+(herman[oa]|padre|madre|hij[oa]|espos[oa]|marido|mujer|pareja|prim[oa]|tio|tia|sobrin[oa]|abuel[oa]|niet[oa]|cunad[oa]|yerno|nuera|representante|abogado|emplead[oa]|operari[oa]|limpieza|inquilin[oa]|arrendatari[oa]|vecin[oa]|amig[oa])\b/i;
 
-  // Sobretensión por compañía de la luz
-  const sobretension = c.includes('sobretensión') || c.includes('sobretension');
-  const companiaLuz = /(compa[nñ]i?a|compania|luz|compa[nñ]ia de la luz)/i.test(c);
-  if (sobretension && companiaLuz) return { yes: true, motivo: 'Sobretensión por compañía de la luz' };
-
-  // Robo con sustracción (o robo/hurto/expoliación/sustracción)
-  if (/(robo|hurto|expoliaci[oó]n|sustracci[oó]n)/i.test(c)) {
-    return { yes: true, motivo: 'Robo / Hurto / Expoliación / Sustracción' };
-  }
-
-  // RC / Responsabilidad civil
-  if (/\brc\b/i.test(c) || /responsabilidad\s+civil/i.test(c)) {
-    return { yes: true, motivo: 'Responsabilidad civil (RC)' };
-  }
-
-  // Lesiones
-  if (/lesion/i.test(c)) {
-    return { yes: true, motivo: 'Lesiones' };
-  }
-
-  return { yes: false, motivo: null };
+function norm(text) {
+  return String(text || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// ENTRY POINT
-// ═══════════════════════════════════════════════════════════════════════════
-async function processMessage(incomingMessage, senderNumber) {
-  let conv = conversationManager.getConversation(senderNumber);
-
-  if (!conv) {
-    conv = conversationManager.createOrUpdateConversation(senderNumber, {
-      stage: 'consent',
-      status: 'new',
-      userData: {},
-      attempts: 0,
-      misunderstandCount: 0,
-      history: [],
-    });
-  }
-
-  const msg = (incomingMessage || '').trim();
-  const msgLower = msg.toLowerCase();
-  const nexp = conv.userData?.nexp || null;
-
-  console.log('\n┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-  console.log(`┃ 📬 Mensaje: "${msg}"`);
-  console.log(`┃ 📊 Stage: ${conv.stage} | Nexp: ${nexp || '—'}`);
-  console.log(`┃ 👤 ${senderNumber}`);
-  console.log('┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n');
-
-  conversationManager.recordUserMessage(senderNumber);
-
-  // ── Quiere hablar con humano (aplica en cualquier stage) ──
-  if (wantsHuman(msgLower)) {
-    return doEscalate(senderNumber, conv, msg, 'Usuario solicitó hablar con un perito/persona');
-  }
-
-  // ── Router por stage ──
-  switch (conv.stage) {
-    case 'consent':
-      return handleConsent(msg, msgLower, senderNumber, conv);
-
-    case 'verify_data':
-      return handleVerifyData(msg, msgLower, senderNumber, conv);
-
-    case 'correct_data':
-      return handleCorrectData(msg, msgLower, senderNumber, conv);
-
-    case 'classify_cause':
-      return doClassifyCause(senderNumber, conv);
-
-    case 'estimate_damage':
-      return handleEstimateDamage(msg, msgLower, senderNumber, conv);
-
-    case 'completed':
-    case 'farewell':
-    case 'closed':
-      return responses.conversacionFinalizada;
-
-    case 'escalated':
-      return responses.yaEscalado;
-
-    default:
-      console.warn('⚠️  Stage desconocido:', conv.stage);
-      return doEscalate(senderNumber, conv, msg, 'Stage desconocido');
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// PASO 1 — VERIFICAR DATOS
-// ═══════════════════════════════════════════════════════════════════════════
-async function handleConsent(msg, msgLower, senderNumber, conv) {
-  const nexp = conv.userData?.nexp;
-
-  // ✅ Datos correctos
-  if (isAffirmative(msgLower)) {
-    logRespuesta(nexp, 'consent', 'Verificación de datos', msg);
-    persistSiniestro(nexp, { datos_verificados: true, estado: 'en_curso' });
-    saveConv(senderNumber, { stage: 'classify_cause', misunderstandCount: 0 }, msg);
-    return doClassifyCause(senderNumber, conv);
-  }
-
-  // ❌ Datos incorrectos
-  if (wantsCorrection(msgLower)) {
-    logRespuesta(nexp, 'consent', 'Verificación de datos', msg);
-    persistSiniestro(nexp, { datos_verificados: false, estado: 'en_curso' });
-    saveConv(senderNumber, { stage: 'correct_data', misunderstandCount: 0 }, msg);
-    return aiText('pedirDatosCorregidos', conv.userData);
-  }
-
-  // 🚫 No es el asegurado
-  if (notInsured(msgLower)) {
-    logRespuesta(nexp, 'consent', 'Verificación de datos', msg);
-    persistSiniestro(nexp, { estado: 'cerrado_no_asegurado' });
-    saveConv(senderNumber, { stage: 'closed', status: 'closed' }, msg);
-    return aiText('noEsAsegurado', conv.userData);
-  }
-
-  // 🤷 No entendemos
-  return doMisunderstand(senderNumber, conv, msg, await aiText('reformularConsent', conv.userData));
-}
-
-async function handleVerifyData(msg, msgLower, senderNumber, conv) {
-  const nexp = conv.userData?.nexp;
-
-  if (isAffirmative(msgLower)) {
-    logRespuesta(nexp, 'verify_data', 'Re-verificación tras corrección', msg);
-    persistSiniestro(nexp, { datos_verificados: true, estado: 'en_curso' });
-    saveConv(senderNumber, { stage: 'classify_cause', misunderstandCount: 0 }, msg);
-    return doClassifyCause(senderNumber, conv);
-  }
-
-  if (isNegative(msgLower) || wantsCorrection(msgLower)) {
-    logRespuesta(nexp, 'verify_data', 'Re-verificación tras corrección', msg);
-    saveConv(senderNumber, { stage: 'correct_data', misunderstandCount: 0 }, msg);
-    return aiText('pedirDatosCorregidos', conv.userData);
-  }
-
-  return doMisunderstand(senderNumber, conv, msg, await aiText('reformularVerify', conv.userData));
-}
-
-async function handleCorrectData(msg, msgLower, senderNumber, conv) {
-  const nexp = conv.userData?.nexp;
-  const corrections = parseCorrections(msg);
-  const userData = { ...(conv.userData || {}), ...corrections };
-
-  // Guardar correcciones
-  logRespuesta(nexp, 'correct_data', 'Corrección de datos', msg);
-
-  // Actualizamos también los campos principales del JSON (para que queden consistentes)
-  persistSiniestro(nexp, {
-    datos_corregidos: corrections,
-    nexp: userData.nexp || nexp,
-    fecha_siniestro: userData.fecha || userData.fecha_siniestro,
-    causa: userData.causa,
-    aseguradora: userData.aseguradora,
-    telefono: userData.telefono,
-    nombre: userData.nombre,
-  });
-
-  // Pedimos re-verificación
-  saveConv(senderNumber, { stage: 'verify_data', userData, misunderstandCount: 0 }, msg);
-
-  const resumen = buildDataSummary(userData);
-  return aiText('confirmarDatosCorregidos', { ...userData, resumen });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// PASO 2 — CLASIFICAR CAUSA
-// ═══════════════════════════════════════════════════════════════════════════
-async function doClassifyCause(senderNumber, conv) {
-  const freshConv = conversationManager.getConversation(senderNumber) || conv;
-  const causaRaw = freshConv.userData?.causa || '';
-  const nexp = freshConv.userData?.nexp;
-
-  console.log(`🔍 Clasificando causa: "${String(causaRaw)}"`);
-
-  const { yes: presencialOnly, motivo } = isPresencialOnlyByCause(causaRaw);
-
-  if (presencialOnly) {
-    console.log('🏠 → Presencial obligatoria por tipo de causa');
-
-    // Paso 3: urgencia silenciosa
-    const urgency = await analyzeUrgency(freshConv.userData || {});
-
-    persistSiniestro(nexp, {
-      tipo_visita: 'presencial',
-      motivo_tipo_visita: 'Causa requiere visita presencial',
-      estimacion_danos: null,
-      urgencia: {
-        urgente: urgency.urgente,
-        motivo: urgency.motivo,
-      },
-      estado: 'completado',
-      completado_at: new Date().toISOString(),
-      clasificacion: { motivo_presencial: motivo || 'Causa requiere visita presencial' },
-    });
-
-    saveConv(senderNumber, { stage: 'completed', status: 'completed' }, '[AUTO_PRESENCIAL]');
-    return aiText('finalPresencialPorCausa', freshConv.userData);
-  }
-
-  // No es presencial obligatoria → pedir estimación/horquilla
-  console.log('💰 → Pedir estimación de daños');
-
-  saveConv(senderNumber, { stage: 'estimate_damage', misunderstandCount: 0 }, '[AUTO]');
-  return aiText('pedirEstimacionDanos', freshConv.userData);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// PASO 2b — ESTIMACIÓN DE DAÑOS → DIGITAL o PRESENCIAL
-// ═══════════════════════════════════════════════════════════════════════════
-async function handleEstimateDamage(msg, msgLower, senderNumber, conv) {
-  const estimate = extractDamageEstimate(msg);
-  const nexp = conv.userData?.nexp;
-
-  if (!estimate) {
-    return doMisunderstand(senderNumber, conv, msg, await aiText('reformularEstimacion', conv.userData));
-  }
-
-  logRespuesta(nexp, 'estimate_damage', 'Estimación de daños económicos', msg);
-
-  // Para el umbral usamos una referencia conservadora: si es rango, el máximo; si es importe, el importe.
-  const reference = estimate.tipo === 'rango' ? estimate.max : estimate.importe;
-  const isPresencial = reference > DAMAGE_THRESHOLD;
-  const tipoVisita = isPresencial ? 'presencial' : 'digital';
-
-  console.log(`💰 Estimación: ref=${reference}€ (umbral: ${DAMAGE_THRESHOLD}€) → ${tipoVisita.toUpperCase()}`);
-
-  const freshConv = conversationManager.getConversation(senderNumber) || conv;
-
-  // Paso 3: urgencia silenciosa
-  const urgency = await analyzeUrgency({ ...(freshConv.userData || {}), estimacion_danos: estimate });
-
-  // Persistimos estimación con formato “horquilla”
-  const estimacion_danos =
-    estimate.tipo === 'rango'
-      ? {
-          tipo: 'rango',
-          min: estimate.min,
-          max: estimate.max,
-          referencia: reference,
-          respuesta_original: msg,
-          umbral: DAMAGE_THRESHOLD,
-          supera_umbral: isPresencial,
-        }
-      : {
-          tipo: 'importe',
-          referencia: reference,
-          importe: estimate.importe,
-          respuesta_original: msg,
-          umbral: DAMAGE_THRESHOLD,
-          supera_umbral: isPresencial,
-        };
-
-  persistSiniestro(nexp, {
-    estimacion_danos,
-    tipo_visita: tipoVisita,
-    motivo_tipo_visita: isPresencial
-      ? `Estimación supera ${DAMAGE_THRESHOLD}€`
-      : `Estimación no supera ${DAMAGE_THRESHOLD}€ — cita digital posible`,
-    urgencia: { urgente: urgency.urgente, motivo: urgency.motivo },
-    estado: 'completado',
-    completado_at: new Date().toISOString(),
-  });
-
-  saveConv(senderNumber, { stage: 'completed', status: 'completed', misunderstandCount: 0 }, msg);
-
-  // Paso 4: Mensaje final
-  if (isPresencial) return aiText('finalPresencialPorImporte', { ...freshConv.userData, estimacion_danos });
-  return aiText('finalDigital', { ...freshConv.userData, estimacion_danos });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ESCALACIÓN
-// ═══════════════════════════════════════════════════════════════════════════
-function doEscalate(senderNumber, conv, msg, reason) {
-  console.log(`🚨 Escalando: ${reason}`);
-  const nexp = conv.userData?.nexp;
-
-  logRespuesta(nexp, conv.stage, 'Escalación', msg);
-  persistSiniestro(nexp, {
-    estado: 'escalado',
-    escalacion: {
-      motivo: reason,
-      stage_al_escalar: conv.stage,
-      escalado_at: new Date().toISOString(),
-    },
-  });
-
-  saveConv(
-    senderNumber,
-    {
-      stage: 'escalated',
-      status: 'escalated',
-      escalatedAt: Date.now(),
-      escalationReason: reason,
-    },
-    msg
-  );
-
-  return aiText('escalacion', conv.userData);
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// NO ENTENDEMOS → REINTENTAR o ESCALAR
-// ═══════════════════════════════════════════════════════════════════════════
-async function doMisunderstand(senderNumber, conv, msg, retryMessage) {
-  const count = (conv.misunderstandCount || 0) + 1;
-
-  if (count >= MAX_MISUNDERSTAND) {
-    return doEscalate(senderNumber, conv, msg, `No se pudo entender al usuario tras ${count} intentos`);
-  }
-
-  const nexp = conv.userData?.nexp;
-  logRespuesta(nexp, conv.stage, 'Mensaje no entendido', msg);
-
-  saveConv(senderNumber, { misunderstandCount: count }, msg);
-  return retryMessage;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// HELPERS DE PERSISTENCIA
-// ═══════════════════════════════════════════════════════════════════════════
-function persistSiniestro(nexp, data) {
-  if (!nexp) return;
-  siniestroStore.update(nexp, data);
-}
-
-function logRespuesta(nexp, stage, pregunta, respuesta) {
-  if (!nexp) return;
-  siniestroStore.addRespuesta(nexp, stage, pregunta, respuesta);
-}
-
-function saveConv(senderNumber, updates, userMsg) {
-  const conv = conversationManager.getConversation(senderNumber) || {};
-  const history = conv.history || [];
-
-  if (userMsg && userMsg !== '[AUTO]' && !String(userMsg).startsWith('[AUTO_')) {
-    history.push({ role: 'user', content: userMsg, timestamp: Date.now() });
-  }
-
-  conversationManager.createOrUpdateConversation(senderNumber, {
-    ...updates,
-    history: history.slice(-30),
-    lastResponseAt: Date.now(),
-  });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// IA: generación de textos por stage (con fallback a responses fijos)
-// ═══════════════════════════════════════════════════════════════════════════
-async function aiText(kind, ctx = {}) {
-  const base = {
-    nexp: ctx.nexp,
-    fecha_siniestro: ctx.fecha || ctx.fecha_siniestro,
-    causa: ctx.causa,
-    aseguradora: ctx.aseguradora,
-    nombre: ctx.nombre,
-    telefono: ctx.telefono,
-  };
-
-  const prompts = {
-    noEsAsegurado: `Redacta un mensaje breve en español disculpándote porque la persona indica que no es el asegurado. Despídete.`,
-    pedirDatosCorregidos: `Pide en español que indique qué datos son incorrectos y que los corrija en un solo mensaje. Da un ejemplo con Nombre, Teléfono y Fecha.`,
-    confirmarDatosCorregidos: `Confirma los datos actualizados y pregunta si ahora son correctos. Incluye este resumen:\n\n${ctx.resumen || ''}`,
-    reformularConsent: `No has entendido. Pide que responda escribiendo: "Sí" (datos correctos), "No" (hay errores) o "No soy el asegurado".`,
-    reformularVerify: `Pide confirmar si los datos actualizados son correctos. Que responda escribiendo "Sí" o "No".`,
-    pedirEstimacionDanos: `Pide una estimación aproximada de los daños en euros. Indica que puede responder con un importe (ej. 2000) o un rango (ej. 1000-3000).`,
-    reformularEstimacion: `No has podido identificar el importe. Pide que lo indique con un número en euros (por ejemplo 3000€ o 1000-3000€).`,
-    escalacion: `Indica en español que un perito se pondrá en contacto directamente para continuar, y agradece su paciencia.`,
-    finalPresencialPorCausa: `Redacta un mensaje final: agradece la atención, indica que la visita será presencial por el tipo de siniestro y que un perito contactará para concertar cita. Despídete.`,
-    finalPresencialPorImporte: `Redacta un mensaje final: agradece la atención, indica que por la estimación de daños la visita será presencial y que un perito contactará para concertar cita. Despídete.`,
-    finalDigital: `Redacta un mensaje final: agradece la atención, indica que la gestión puede ser digital (videollamada) y que un perito contactará para concertar cita. Despídete.`,
-  };
-
-  const instruction = prompts[kind] || `Redacta un mensaje breve y profesional en español.`;
-
-  const prompt = `Eres un asistente de un gabinete pericial. Tono profesional y cercano. No menciones que eres IA.\n\nContexto del siniestro:\n${JSON.stringify(base, null, 2)}\n\nInstrucción:\n${instruction}\n`;
-
-  try {
-    const out = await generateResponse(prompt);
-    const t = String(out || '').trim();
-    if (t) return t;
-  } catch {
-    // fallback abajo
-  }
-
-  // fallback: respuestas fijas si existen
-  switch (kind) {
-    case 'noEsAsegurado':
-      return responses.noEsAsegurado;
-    case 'pedirDatosCorregidos':
-      return responses.pedirDatosCorregidos;
-    case 'reformularConsent':
-      return responses.reformularConsent;
-    case 'reformularVerify':
-      return responses.reformularVerify;
-    case 'pedirEstimacionDanos':
-      return responses.pedirEstimacionDanos;
-    case 'reformularEstimacion':
-      return responses.reformularEstimacion;
-    case 'escalacion':
-      return responses.escalacion;
-    case 'finalPresencialPorCausa':
-      return responses.visitaPresencial + '\n\n' + responses.despedida;
-    case 'finalPresencialPorImporte':
-      return responses.visitaPresencialPorDanos(
-        ctx?.estimacion_danos?.referencia || ctx?.estimacion_danos?.importe || DAMAGE_THRESHOLD + 1
-      ) + '\n\n' + responses.despedida;
-    case 'finalDigital':
-      return responses.visitaDigital + '\n\n' + responses.despedida;
-    default:
-      return responses.ocupado;
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// UTILIDADES DE TEXTO
-// ═══════════════════════════════════════════════════════════════════════════
-function isAffirmative(t) {
-  t = t.trim();
+function isPeritoAttendeePrompt(text) {
+  const t = norm(text);
   return (
-    /^(s[ií]|correcto|correctos|son correctos|vale|ok|de acuerdo|afirmativo|claro|exacto|eso es|perfecto|bien|todo bien|todo correcto)$/i.test(t) ||
-    /^s[ií],?\s*(son\s+)?correctos?/i.test(t) ||
-    /^s[ií],?\s*(est[aá]n?\s+)?bien/i.test(t)
+    (t.includes('quien') && t.includes('atendera') && t.includes('perito')) ||
+    t.includes('atienda al perito') ||
+    t.includes('atendera al perito') ||
+    t.includes('atendera al perito cuando realice la visita') ||
+    (t.includes('perito') && (t.includes('telefono') || t.includes('contactar'))) ||
+    (t.includes('sera usted') && t.includes('atienda al perito'))
   );
 }
 
-function isNegative(t) {
-  return /^(no|incorrecto|incorrectos|negativo|mal|están?\s+mal)$/i.test(t.trim());
+function isPeritoAttendeeMentionInUser(text) {
+  const t = norm(text);
+  return (
+    t.includes('atienda al perito') ||
+    t.includes('atendera al perito') ||
+    (t.includes('perito') && t.includes('atender'))
+  );
 }
 
-function wantsHuman(t) {
-  return /(hablar.*(perito|persona|humano|agente))|(no\s+quiero\s+(hablar\s+con\s+)?(la\s+)?ia)|(prefer?ir[ío]?\s+.*persona)|(quiero\s+.*perito)|(llam[ae].*perito)|(atenci[oó]n\s+humana)|(agente\s+real)/i.test(t);
+function isAffirmativeAck(text) {
+  const t = String(text || '').trim().toLowerCase();
+  return /^(si|sí|ok|vale|perfecto|correcto|todo ok|todo correcto|de acuerdo|confirmado)$/.test(t);
 }
 
-function wantsCorrection(t) {
-  return /(no\s+(est[aá]n?|son)\s+correctos?)|(hay\s+.*error)|(est[aá]n?\s+mal)|(corregir)|(cambiar\s+dato)|(no,?\s+hay\s+(un\s+)?error)/i.test(t);
-}
+function isDefinitiveClosingMessage(text) {
+  const t = String(text || '').toLowerCase();
+  if (!t) return false;
 
-function notInsured(t) {
-  return /(no\s+soy\s+(el|la)\s+asegurad[oa])|(no\s+es\s+mi\s+seguro)|(n[uú]mero\s+equivocado)|(se\s+(ha\s+)?equivoca)/i.test(t);
-}
-
-// Extrae estimación: rango o importe
-function extractDamageEstimate(text) {
-  const raw = String(text || '');
-  const cleaned = raw
-    .replace(/\./g, '')      // 5.000 -> 5000
-    .replace(/,/g, '.')      // 5,5 -> 5.5
-    .replace(/€/g, ' € ')
-    .replace(/\s+/g, ' ')
-    .trim();
-
-  // Rangos: "entre 1000 y 3000" | "de 1000 a 3000" | "1000-3000"
-  let m = cleaned.match(/entre\s+(\d+(?:\.\d+)?)\s+y\s+(\d+(?:\.\d+)?)/i);
-  if (!m) m = cleaned.match(/de\s+(\d+(?:\.\d+)?)\s+a\s+(\d+(?:\.\d+)?)/i);
-  if (!m) m = cleaned.match(/(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)/);
-
-  if (m) {
-    const a = Number(m[1]);
-    const b = Number(m[2]);
-    if (!Number.isNaN(a) && !Number.isNaN(b)) {
-      const min = Math.min(a, b);
-      const max = Math.max(a, b);
-      return { tipo: 'rango', min, max };
-    }
+  // Señales de "resumen pendiente de confirmación": no debe cerrarse aún.
+  if (
+    t.includes('si algún dato no es correcto') ||
+    t.includes('si algun dato no es correcto') ||
+    t.includes('indíquenoslo para ajustarlo') ||
+    t.includes('indiquenoslo para ajustarlo') ||
+    t.includes('para comprobar que están correctos') ||
+    t.includes('para comprobar que estan correctos')
+  ) {
+    return false;
   }
 
-  // Importe único: primer número “razonable”
-  const one = cleaned.match(/(\d+(?:\.\d+)?)\s*(?:€|euros?|eur)?/i);
-  if (one) {
-    const n = Number(one[1]);
-    if (!Number.isNaN(n)) return { tipo: 'importe', importe: n };
+  // Señales de cierre definitivo.
+  return (
+    t.includes('finalizamos la gestión por este medio') ||
+    t.includes('finalizamos la gestion por este medio') ||
+    t.includes('finalizamos la comunicaci') ||
+    t.includes('expediente ya está en gestión con el perito') ||
+    t.includes('expediente ya esta en gestion con el perito') ||
+    t.includes('trasladamos la información al perito') ||
+    t.includes('trasladamos la informacion al perito') ||
+    t.includes('le contactará el perito') ||
+    t.includes('le contactara el perito')
+  );
+}
+
+function normalizeContactPhone(raw) {
+  if (!raw) return '';
+  let digits = String(raw).replace(/\D+/g, '');
+  if (!digits) return '';
+  if (digits.startsWith('00')) digits = digits.slice(2);
+  if (/^\d{9}$/.test(digits) && /^[6-9]/.test(digits)) digits = `34${digits}`;
+  return digits;
+}
+
+function extractRelationship(text) {
+  const m = String(text || '').toLowerCase().match(RELATION_RE);
+  return m?.[1] ? m[1] : '';
+}
+
+function detectEconomicEstimate(text) {
+  const raw = String(text || '').trim();
+  const lowered = raw.toLowerCase();
+  if (!raw) return null;
+
+  // Rango: "1000-3000", "entre 1000 y 3000", "de 1000 a 3000"
+  const rangeMatch = lowered.match(/(?:entre\s+)?(\d{1,2}(?:[.,]\d{3})+|\d{1,5})\s*(?:-|a|y)\s*(\d{1,2}(?:[.,]\d{3})+|\d{1,5})/i);
+  if (rangeMatch) {
+    const a = rangeMatch[1].replace(/\./g, '');
+    const b = rangeMatch[2].replace(/\./g, '');
+    return `${a} - ${b} €`;
   }
 
-  // Palabras (muy básico)
-  const words = {
-    'mil': 1000,
-    'dos mil': 2000,
-    'tres mil': 3000,
-    'cuatro mil': 4000,
-    'cinco mil': 5000,
-    'seis mil': 6000,
-    'siete mil': 7000,
-    'ocho mil': 8000,
-    'nueve mil': 9000,
-    'diez mil': 10000,
-    'quince mil': 15000,
-    'veinte mil': 20000,
-  };
-  const lower = raw.toLowerCase();
-  const sorted = Object.entries(words).sort((a, b) => b[0].length - a[0].length);
-  for (const [w, n] of sorted) {
-    if (lower.includes(w)) return { tipo: 'importe', importe: n };
+  // Importe con símbolo/palabra de moneda
+  const moneyMatch = lowered.match(/(\d{1,2}(?:[.,]\d{3})+|\d{1,5})(?:[.,]\d{1,2})?\s*(?:€|euros?|eur)\b/i);
+  if (moneyMatch) {
+    return `${moneyMatch[1].replace(/\./g, '')} €`;
+  }
+
+  // Solo número corto (p.ej. "200")
+  const justNumber = lowered.match(/^(\d{1,4})(?:[.,]\d{1,2})?$/);
+  if (justNumber) {
+    return `${justNumber[1]} €`;
   }
 
   return null;
 }
 
-function parseCorrections(text) {
-  const out = {};
-  const lines = String(text || '').split('\n').map(l => l.trim()).filter(Boolean);
-
-  for (const l of lines) {
-    const m = l.match(/^[-•]?\s*(\w[\w\s]*?)\s*:\s*(.+)$/i);
-    if (!m) continue;
-    const k = m[1].toLowerCase().trim();
-    const v = m[2].trim();
-
-    if (k.startsWith('nom') || k.startsWith('asegurad')) out.nombre = v;
-    else if (k.startsWith('tel') || k.startsWith('móvil') || k.startsWith('movil')) out.telefono = v;
-    else if (k.includes('exp') || k.includes('encargo') || k.includes('nº') || k.includes('num')) out.nexp = v;
-    else if (k.startsWith('fec')) out.fecha = v;
-    else if (k.startsWith('caus') || k.includes('siniestro')) out.causa = v;
-    else if (k.startsWith('aseguradora') || k.includes('compañ')) out.aseguradora = v;
-    else if (k.startsWith('dir') || k.startsWith('calle')) out.direccion = v;
-  }
-
-  if (Object.keys(out).length === 0 && text.length > 0) out._texto_libre = text;
-  return out;
+async function lookupCP(text) {
+  const match = text.match(/\b(\d{5})\b/);
+  if (!match) return null;
+  const cp = match[1];
+  if (cpCache[cp]) return cpCache[cp];
+  try {
+    const res = await axios.get(`https://api.zippopotam.us/es/${cp}`, { timeout: 3000 });
+    const place = res.data.places?.[0];
+    if (place) {
+      const info = { cp, localidad: place['place name'], provincia: place.state };
+      cpCache[cp] = info;
+      return info;
+    }
+  } catch { /* CP no encontrado o API no disponible */ }
+  return null;
 }
 
-function buildDataSummary(userData) {
-  const fields = [
-    ['Encargo (Nº Exp.)', userData.nexp],
-    ['Fecha siniestro', userData.fecha || userData.fecha_siniestro],
-    ['Causa', userData.causa],
-    ['Aseguradora', userData.aseguradora],
-    ['Teléfono', userData.telefono],
-    ['Nombre', userData.nombre],
-  ];
-  return fields
-    .filter(([, v]) => v)
-    .map(([label, value]) => `- ${label}: ${value}`)
-    .join('\n');
+/**
+ * Procesa un mensaje entrante de WhatsApp.
+ * @param {string} waId       - número sin + (ej. "34674742564")
+ * @param {object} messageObj - objeto normalizado del whatsappAdapter
+ */
+async function processMessage(waId, messageObj) {
+  try {
+    const text = (messageObj.text || '').trim();
+    if (!text) return;
+    let stageAplicado = null;
+
+    // Buscar el nexp vinculado a este número
+    const nexp = conversationManager.getNexpByWaId(waId);
+    if (!nexp) {
+      console.log(`⚠️  Número ${waId} sin expediente vinculado — ignorando`);
+      return;
+    }
+
+    // ── Máquina de estados ───────────────────────────────────────────────
+    const conversation = conversationManager.getConversation(waId);
+    const stateCheck = canProcess(conversation);
+    if (!stateCheck.ok) {
+      console.log(`⛔ [${waId}] bloqueado (${stateCheck.reason}) stage=${conversation?.stage}`);
+      if (stateCheck.response) {
+        await adapter.sendText(waId, stateCheck.response);
+        if (conversation.stage === 'finalizado') {
+          conversationManager.createOrUpdateConversation(waId, { stage: 'cerrado' });
+        }
+      }
+      return;
+    }
+
+    // Registrar actividad (resetea inactivityAttempts y nextReminderAt)
+    conversationManager.recordUserMessage(waId);
+
+    // Leer datos del siniestro y mensajes desde Excel
+    const userData        = conversation.userData || {};
+    const mensajesPrevios = conversationManager.getMensajes(waId);
+    const lastBotMessage = [...mensajesPrevios].reverse().find(m => m?.direction === 'out')?.text || '';
+    const relationFromCurrent = extractRelationship(text);
+    const peritoAttendeeContext = isPeritoAttendeePrompt(lastBotMessage) || isPeritoAttendeeMentionInUser(text);
+    const relationAlreadyKnown = Boolean(
+      (!peritoAttendeeContext && relationFromCurrent) ||
+      (conversation.relacion && String(conversation.relacion).trim())
+    );
+    const estimateFromCurrent = detectEconomicEstimate(text);
+    const estimateAlreadyKnown = Boolean((conversation.danos && String(conversation.danos).trim()) || estimateFromCurrent);
+
+    const valoresExcel = {
+      saludo:        new Date().getHours() < 12 ? 'Buenos días' : 'Buenas tardes',
+      aseguradora:   userData.aseguradora   || 'la aseguradora',
+      nexp,
+      causa:         userData.causa         || '',
+      observaciones: userData.observaciones || '',
+      nombre:        userData.nombre        || 'el titular',
+      direccion:     userData.direccion     || '',
+      cp:            userData.cp            || '',
+      municipio:     userData.municipio     || '',
+    };
+
+    const historial = mensajesPrevios.map(m => ({
+      role:  m.direction === 'in' ? 'user' : 'model',
+      parts: [{ text: m.text }],
+    }));
+
+    // Enriquecer contexto con CP si se detecta
+    const cpInfo = await lookupCP(text);
+    const hoy = new Date();
+    const diasSemana = ['domingo','lunes','martes','miércoles','jueves','viernes','sábado'];
+    const fechaHoy = `${String(hoy.getDate()).padStart(2,'0')}/${String(hoy.getMonth()+1).padStart(2,'0')}/${hoy.getFullYear()}`;
+    let contextoSistema = `[INFO]: Fecha actual: ${diasSemana[hoy.getDay()]} ${fechaHoy}. Ubicación: ${valoresExcel.direccion}, CP ${valoresExcel.cp}, ${valoresExcel.municipio}.`;
+    if (valoresExcel.observaciones) {
+      contextoSistema += `\n[OBSERVACIONES DEL EXPEDIENTE]: ${valoresExcel.observaciones}`;
+    }
+    if (cpInfo) {
+      contextoSistema += `\n[CP DETECTADO]: El código postal ${cpInfo.cp} corresponde a ${cpInfo.localidad} (${cpInfo.provincia}). No preguntes la localidad, úsala directamente.`;
+    }
+    contextoSistema += '\n[Videoperitación]: Si el usuario no expresa dudas, no expliques funcionamiento; pregunta disponibilidad directa (mañana/tarde).';
+    contextoSistema += '\n[DISTINCIÓN DE CAMPOS]: "Relación" es SOLO la relación del interlocutor actual con el asegurado. "AT. Perito" es SOLO la persona que atenderá al perito en la visita.';
+    if (peritoAttendeeContext) {
+      contextoSistema += '\n[CONTEXTO ACTUAL]: El usuario está respondiendo sobre quién atenderá al perito. Extrae nombre_contacto/relacion_contacto/telefono_contacto para "AT. Perito". No cambies la columna "Relación" del interlocutor.';
+    }
+    if (relationAlreadyKnown) {
+      contextoSistema += '\n[DATO YA INFORMADO]: El interlocutor ya ha indicado su relación con el asegurado. No vuelvas a preguntar la relación; solicita solo el dato que falte.';
+    }
+    if (estimateAlreadyKnown) {
+      const estimateRef = estimateFromCurrent || String(conversation.danos || '').trim();
+      contextoSistema += `\n[DATO YA INFORMADO]: Ya existe estimación económica (${estimateRef}). No la vuelvas a pedir y avanza al siguiente paso.`;
+    }
+    if (
+      (lastBotMessage.toLowerCase().includes('si algún dato no es correcto') || lastBotMessage.toLowerCase().includes('si algun dato no es correcto')) &&
+      isAffirmativeAck(text)
+    ) {
+      contextoSistema += '\n[CONFIRMACIÓN RESUMEN]: El usuario confirma que los datos están correctos. Envía despedida final y marca estado_expediente="finalizado".';
+    }
+
+    // ── Llamada a la IA ──────────────────────────────────────────────────
+    const respuestaIA = await procesarConIA(historial, text, contextoSistema, valoresExcel);
+
+    // Persistir mensajes y datos extraídos en el Excel
+    if (respuestaIA.mensaje_entendido) {
+      const {
+        nombre_contacto,
+        relacion_contacto,
+        telefono_contacto,
+        importe_estimado,
+        acepta_videollamada,
+        preferencia_horaria,
+        estado_expediente,
+      } = respuestaIA.datos_extraidos || {};
+
+      const excelUpdates = {
+        mensajes: [
+          ...mensajesPrevios,
+          { direction: 'in',  text, timestamp: new Date().toISOString() },
+          { direction: 'out', text: respuestaIA.mensaje_para_usuario, timestamp: new Date().toISOString() },
+        ],
+      };
+      const relacionInterlocutor = String(peritoAttendeeContext ? '' : (relationFromCurrent || relacion_contacto || '')).trim();
+      if (relacionInterlocutor) {
+        excelUpdates.relacion = relacionInterlocutor;
+      }
+
+      const shouldUpdateAttPerito = peritoAttendeeContext && Boolean(nombre_contacto || relacion_contacto || relationFromCurrent || telefono_contacto);
+      if (shouldUpdateAttPerito) {
+        const [exNombre = '', exRelacion = '', exTelefono = ''] = String(conversation.attPerito || '').split(' - ');
+        const nombreAtt = String(nombre_contacto || '').trim() || (exNombre !== 'sin indicar' ? exNombre : '') || 'sin indicar';
+        const relacionAtt = String(relacion_contacto || relationFromCurrent || '').trim() || (exRelacion !== 'sin indicar' ? exRelacion : '') || 'sin indicar';
+        const telefonoAtt = normalizeContactPhone(telefono_contacto) || normalizeContactPhone(exTelefono) || normalizeContactPhone(waId);
+        excelUpdates.attPerito = `${nombreAtt} - ${relacionAtt} - ${telefonoAtt}`;
+      }
+      if (importe_estimado || estimateFromCurrent) {
+        excelUpdates.danos = String(importe_estimado || estimateFromCurrent).trim();
+      }
+      if (typeof acepta_videollamada === 'boolean') {
+        excelUpdates.digital = acepta_videollamada ? 'Sí' : 'No';
+      }
+      if (preferencia_horaria === 'mañana') excelUpdates.horario = 'Mañana';
+      else if (preferencia_horaria === 'tarde') excelUpdates.horario = 'Tarde';
+
+      const nuevoStage = ESTADO_IA_TO_STAGE[estado_expediente];
+      if (nuevoStage) {
+        if (nuevoStage === 'finalizado' && !isDefinitiveClosingMessage(respuestaIA.mensaje_para_usuario)) {
+          console.warn(`⚠️  IA marcó "finalizado" sin despedida explícita; no se cierra aún | Expediente: ${nexp}`);
+        } else {
+          stageAplicado = nuevoStage;
+          excelUpdates.stage = nuevoStage;
+          excelUpdates.contacto = 'Sí'; // Conversación terminada con el asegurado
+          console.log(`🔄 Stage actualizado → ${nuevoStage} | Expediente: ${nexp}`);
+        }
+      }
+
+      conversationManager.createOrUpdateConversation(waId, excelUpdates);
+
+      // Disparo automático a PeritoLine cuando se cierra conversación con contacto válido.
+      if (excelUpdates.contacto === 'Sí' && (stageAplicado === 'finalizado' || stageAplicado === 'escalated')) {
+        triggerEncargoSync(nexp, `stage_${stageAplicado}`);
+      }
+
+      // Generar PDF de transcripción al finalizar la conversación
+      if (stageAplicado === 'finalizado' || stageAplicado === 'escalated') {
+        const allMsgs = excelUpdates.mensajes || conversationManager.getMensajes(waId);
+        generateConversationPdf(nexp, userData, allMsgs, {
+          stage:     stageAplicado,
+          contacto:  excelUpdates.contacto,
+          attPerito: conversation.attPerito,
+          danos:     conversation.danos     || excelUpdates.danos,
+          digital:   conversation.digital   || excelUpdates.digital,
+          horario:   conversation.horario   || excelUpdates.horario,
+        }).catch(e => console.error(`❌ Error generando PDF nexp=${nexp}:`, e.message));
+      }
+    }
+
+    // ── Enviar respuesta ─────────────────────────────────────────────────
+    console.log(`🤖 Respuesta IA: "${respuestaIA.mensaje_para_usuario}"`);
+    if (!respuestaIA.mensaje_para_usuario) {
+      console.warn(`⚠️  IA devolvió mensaje vacío — no se envía nada | Expediente: ${nexp}`);
+      conversationManager.recordResponse(waId);
+      return;
+    }
+    const result = await adapter.sendText(waId, respuestaIA.mensaje_para_usuario);
+    console.log(`✅ Enviado (msgId: ${result?.messageId}) | Expediente: ${nexp} | Entendido: ${respuestaIA.mensaje_entendido}`);
+
+    conversationManager.recordResponse(waId);
+
+    // No cerramos aquí: stage "finalizado" permite una última respuesta segura
+    // si el usuario vuelve a escribir. El paso a "cerrado" se hace en canProcess.
+
+  } catch (error) {
+    console.error('❌ Error crítico en processMessage:', error);
+  }
 }
 
 module.exports = { processMessage };

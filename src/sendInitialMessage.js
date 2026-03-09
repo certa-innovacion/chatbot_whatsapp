@@ -1,323 +1,244 @@
-// src/sendInitialMessage.js — v8 (patched)
+// src/sendInitialMessage.js
+// Lee el Excel de Allianz, envía la plantilla inicial de WhatsApp a cada
+// número y registra la conversación en conversationManager.
+
 require('dotenv').config({ override: true });
-
-const XLSX = require('xlsx');
 const path = require('path');
+const XLSX = require('xlsx');
 
+const { sendInitialTemplate, buildSaludoByHour } = require('./bot/templateSender');
 const conversationManager = require('./bot/conversationManager');
-const siniestroStore = require('./bot/siniestroStore');
-const { sendSaludoTemplate, sendTextMessage, normalizePhoneNumber } = require('./bot/sendMessage');
-const { generateResponse } = require('./ai/aiModel');
+const log = require('./utils/logger');
 
-const EXCEL_PATH = process.env.EXCEL_PATH || path.join(__dirname, '..', 'data', 'allianz_latest.xlsx');
-const TEMPLATE_LANG = process.env.WA_TEMPLATE_LANG || 'es';
-const TZ = process.env.WA_TIMEZONE || 'Europe/Madrid';
+// ── Configuración ─────────────────────────────────────────────────────────
 
-function excelSerialToDate(serial) {
-  const n = Number(serial);
-  if (Number.isNaN(n)) return null;
-  const ms = Math.round((n - 25569) * 86400 * 1000);
-  const d = new Date(ms);
-  return Number.isNaN(d.getTime()) ? null : d;
-}
+const EXCEL_PATH = process.env.EXCEL_PATH
+  || path.join(__dirname, '..', 'data', 'allianz_latest.xlsx');
 
-function formatDate(value) {
-  if (!value) return '—';
+// Estado que indica que el registro debe enviarse (ajustar según el Excel)
+const ESTADO_PENDIENTE = (process.env.EXCEL_ESTADO_PENDIENTE || 'OK').toUpperCase();
 
-  if (value instanceof Date && !Number.isNaN(value.getTime())) {
-    const dd = String(value.getDate()).padStart(2, '0');
-    const mm = String(value.getMonth() + 1).padStart(2, '0');
-    const yy = value.getFullYear();
-    return `${dd}/${mm}/${yy}`;
-  }
+// Retardo entre envíos para no saturar la API (ms)
+const SEND_DELAY_MS = Number(process.env.SEND_DELAY_MS || 1500);
 
-  if (typeof value === 'number' || (typeof value === 'string' && /^[0-9]+(\.[0-9]+)?$/.test(value.trim()))) {
-    const n = Number(value);
-    if (!Number.isNaN(n) && n > 20000 && n < 90000) {
-      const d = excelSerialToDate(n);
-      if (d) return formatDate(d);
-    }
-  }
+// ── Utilidades ────────────────────────────────────────────────────────────
 
-  if (typeof value === 'string') {
-    const s = value.trim();
-    if (s.includes('T') && s.includes('-')) {
-      const parts = s.split('T')[0].split('-');
-      if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
-    }
-    if (/^\d{2}\/\d{2}\/\d{4}$/.test(s)) return s;
-    return s;
-  }
-
-  return String(value);
-}
-
-function capitalizeName(name) {
-  return String(name || '')
-    .toLowerCase()
-    .split(' ')
-    .filter(Boolean)
-    .map(w => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(' ');
-}
-
-function maskPhone(p) {
-  if (!p) return p;
-  const head = p.slice(0, Math.min(4, p.length));
-  const tail = p.slice(-2);
-  return `${head}***${tail}`;
+/**
+ * Convierte un número de teléfono del Excel a wa_id (dígitos puros, sin +).
+ * Ej: 674742564 → "34674742564"
+ */
+function normalizePhone(raw) {
+  if (!raw) return null;
+  let s = String(raw).trim().replace(/[^\d+]/g, '');
+  if (s.startsWith('+'))  s = s.slice(1);
+  if (s.startsWith('00')) s = s.slice(2);
+  // Número móvil español sin prefijo (9 dígitos, empieza por 6-9)
+  if (/^\d{9}$/.test(s) && /^[6-9]/.test(s)) s = `34${s}`;
+  return /^\d{8,15}$/.test(s) ? s : null;
 }
 
 /**
- * Normalización para Excel:
- * - usa la misma lógica que el sender (normalizePhoneNumber),
- * - y devuelve string vacío si es inválido (para que validation lo marque).
+ * Convierte el número de serie de fecha de Excel a string DD/MM/YYYY.
  */
-function normalizePhoneAny(raw) {
-  const norm = normalizePhoneNumber(raw);
-  return norm || '';
+function excelDateToString(serial) {
+  if (!serial || isNaN(serial)) return String(serial || '');
+  const date = XLSX.SSF.parse_date_code(serial);
+  if (!date) return String(serial);
+  return `${String(date.d).padStart(2,'0')}/${String(date.m).padStart(2,'0')}/${date.y}`;
 }
 
-function getSaludo() {
-  const hourStr = new Intl.DateTimeFormat('es-ES', {
-    hour: 'numeric',
-    hour12: false,
-    timeZone: TZ
-  }).format(new Date());
-
-  // tu regla actual:
-  return Number(hourStr) < 14 ? 'Buenos días' : 'Buenas tardes';
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-function validateExcelRow(s) {
-  const errors = [];
-  if (!s.nexp) errors.push('Falta Encargo (nexp)');
-  if (!s.nombre) errors.push('Falta Asegurado (nombre)');
-  if (!s.telefono) errors.push('Falta Teléfono');
-  if (!s.aseguradora) errors.push('Falta Aseguradora');
-  if (!s.causa) errors.push('Falta Causa');
-  if (!s.fecha || s.fecha === '—') errors.push('Falta Fecha Sin.');
+// ── Lectura del Excel ─────────────────────────────────────────────────────
 
-  // teléfono: si existe pero es demasiado corto, probablemente está mal/ambiguo
-  if (s.telefono && s.telefono.length < 10) errors.push('Teléfono parece incompleto/ambiguo');
-
-  return { ok: errors.length === 0, errors };
-}
-
+/**
+ * Lee el Excel y devuelve un array de objetos normalizados.
+ * Cada objeto tiene exactamente los campos que usa el bot.
+ */
 function readExcel(filePath) {
-  const workbook = XLSX.readFile(filePath);
-  const sheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+  const wb = XLSX.readFile(filePath);
+  const ws = wb.Sheets[wb.SheetNames[0]];
+  const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
 
-  console.log(`📊 Excel leído: ${rows.length} filas de "${sheetName}"`);
-
-  return rows.map(row => {
-    // ✅ nombre viene de "Asegurado"
-    const asegurado = row['Asegurado'] || row['ASEGURADO'] || row['Asegurado/a'] || row['Nombre'] || '';
-
-    return {
-      nexp: String(row['Encargo'] || '').trim(),
-      fecha: formatDate(row['Fecha Sin.']),
-      causa: String(row['Causa'] || '').trim(),
-      aseguradora: String(row['Aseguradora'] || '').trim(),
-      telefono: normalizePhoneAny(row['Teléfono']),
-      nombre: capitalizeName(asegurado),
-      estado: String(row['Estado'] || '').trim(),
-      _raw: row
-    };
-  });
+  return rows.map((row, idx) => ({
+    rowIndex:    idx + 2, // 1=cabecera, empieza en 2
+    nexp:          String(row['Encargo']        || '').trim(),
+    fechaSin:      excelDateToString(row['Fecha Sin.']),
+    causa:         String(row['Causa']          || '').trim(),
+    observaciones: String(row['Observaciones']  || '').trim(),
+    aseguradora:   String(row['Aseguradora']    || '').trim(),
+    nombre:        String(row['Asegurado']      || '').trim(),
+    direccion:     String(row['Dirección']      || '').trim(),
+    cp:            String(row['CP']             || '').trim(),
+    municipio:     String(row['Municipio']      || '').trim(),
+    telefonoRaw:   row['Telefono'] || row['Teléfono'] || '',
+    telefono:      normalizePhone(row['Telefono'] || row['Teléfono']),
+    estado:        String(row['Estado']         || '').trim().toUpperCase(),
+  }));
 }
 
-async function buildVerificationTextWithAI(siniestro) {
-  const prompt = `
-Eres un asistente de un gabinete pericial. Redacta UN único mensaje en español (tono profesional y cercano)
-para verificar con el asegurado los datos del siniestro.
+// ── Envío masivo ──────────────────────────────────────────────────────────
 
-Incluye estos datos exactamente:
-- Encargo/expediente: ${siniestro.nexp || '—'}
-- Fecha siniestro: ${siniestro.fecha || '—'}
-- Causa: ${siniestro.causa || '—'}
-- Aseguradora: ${siniestro.aseguradora || '—'}
-- Nombre: ${siniestro.nombre || '—'}
-- Teléfono: ${siniestro.telefono || '—'}
+/**
+ * Procesa todas las filas del Excel:
+ *   1. Filtra las que tienen estado PENDIENTE y teléfono válido
+ *   2. Inicializa el estado de la conversación en el Excel
+ *   3. Envía la plantilla inicial de WhatsApp
+ *
+ * @param {object} opts
+ *   dryRun      {boolean} — si true, solo muestra lo que haría sin enviar
+ *   soloNexp    {string}  — si se indica, solo procesa ese nexp
+ *   soloTelefono {string} — si se indica, solo procesa ese número
+ */
+async function sendInitialMessages(opts = {}) {
+  const { dryRun = false, soloNexp = null, soloTelefono = null } = opts;
 
-Pide que responda escribiendo:
-- "Sí" si todo es correcto, o
-- que indique qué dato/s corregir (por ejemplo: "La fecha es...", "Mi nombre es...", etc.)
+  console.log('\n╔════════════════════════════════════════════════════════════╗');
+  console.log('║     📤 ENVÍO MASIVO DE MENSAJES INICIALES — WhatsApp      ║');
+  console.log('╚════════════════════════════════════════════════════════════╝\n');
 
-Añade también (en una sola frase) que si prefiere hablar con un perito, que lo indique y se le contactará.
-No uses JSON, no pongas encabezados, no uses listas largas.
-`;
-  const text = await generateResponse(prompt);
-  return String(text || '').trim();
-}
+  if (dryRun) console.log('⚠️  MODO DRY-RUN: no se enviarán mensajes reales\n');
 
-async function sendInitial(siniestro) {
-  const saludo = getSaludo();
-
-  console.log(`\n📤 Enviando a ${siniestro.nombre} (${maskPhone(siniestro.telefono)})...`);
-  console.log(`   Encargo: ${siniestro.nexp} | Causa: ${siniestro.causa} | Fecha: ${siniestro.fecha}`);
-
-  const validation = validateExcelRow(siniestro);
-
-  siniestroStore.update(siniestro.nexp, {
-    nexp: siniestro.nexp,
-    fecha_siniestro: siniestro.fecha,
-    causa: siniestro.causa,
-    aseguradora: siniestro.aseguradora,
-    telefono: siniestro.telefono,
-    nombre: siniestro.nombre,
-
-    datos_verificados: false,
-    datos_excel_ok: validation.ok,
-    errores_excel: validation.errors,
-
-    tipo_visita: null,
-    motivo_tipo_visita: null,
-    estimacion_danos: null,
-    urgencia: null,
-
-    estado: 'en_curso',
-    creado_at: new Date().toISOString(),
-    template_enviado: 'saludo',
-    message_id: null,
-
-    historial_respuestas: [],
-    datos_corregidos: null
-  });
-
-  // (opcional) log de validación
-  if (!validation.ok) {
-    console.warn(`⚠️ Validación Excel KO [${siniestro.nexp}]:`, validation.errors.join(' | '));
-  }
-
-  // 1) Template saludo (BODY con 4 params en orden)
-  const result = await sendSaludoTemplate(
-    siniestro.telefono,
-    {
-      saludo,
-      aseguradora: siniestro.aseguradora || '—',
-      nexp: siniestro.nexp || '—',
-      causa: siniestro.causa || '—'
-    },
-    TEMPLATE_LANG
-  );
-
-  console.log(`✅ Template enviado — Message ID: ${result?.messages?.[0]?.id || '—'}`);
-
-  siniestroStore.update(siniestro.nexp, {
-    message_id: result?.messages?.[0]?.id || null
-  });
-
-  conversationManager.createOrUpdateConversation(siniestro.telefono, {
-    status: 'pending',
-    stage: 'consent',
-    attempts: 0,
-    misunderstandCount: 0,
-    lastMessageAt: Date.now(),
-    lastUserMessageAt: null,
-    createdAt: Date.now(),
-    userData: {
-      nexp: siniestro.nexp,
-      fecha: siniestro.fecha,
-      causa: siniestro.causa,
-      aseguradora: siniestro.aseguradora,
-      telefono: siniestro.telefono,
-      nombre: siniestro.nombre
-    },
-    history: []
-  });
-
-  // 2) Texto IA para verificación
-  const verificationText = await buildVerificationTextWithAI(siniestro);
-  if (verificationText) {
-    await sendTextMessage(siniestro.telefono, verificationText);
-    console.log('✅ Mensaje de verificación (IA) enviado');
-  } else {
-    console.warn('⚠️ No se generó texto IA de verificación (vacío)');
-  }
-
-  console.log(`✅ Siniestro ${siniestro.nexp}.json actualizado + conversación registrada`);
-  return result;
-}
-
-async function main() {
-  const arg = process.argv[2];
-
-  if (!arg) {
-    console.error('❌ Uso:');
-    console.error('   node src/sendInitialMessage.js <nexp>       → Enviar un siniestro');
-    console.error('   node src/sendInitialMessage.js --all        → Enviar todos (estado OK)');
-    console.error('   node src/sendInitialMessage.js --list       → Listar siniestros');
-    process.exit(1);
-  }
-
-  let siniestros;
+  let filas;
   try {
-    siniestros = readExcel(EXCEL_PATH);
-  } catch (error) {
-    console.error(`❌ Error leyendo Excel (${EXCEL_PATH}):`, error.message);
-    console.log('💡 Instala xlsx: npm install xlsx');
+    filas = readExcel(EXCEL_PATH);
+    console.log(`📊 Total filas leídas del Excel: ${filas.length}`);
+  } catch (err) {
+    console.error('❌ No se pudo leer el Excel:', err.message);
+    console.error('   Ruta buscada:', EXCEL_PATH);
     process.exit(1);
   }
 
-  if (siniestros.length === 0) {
-    console.log('⚠️  El Excel está vacío');
-    process.exit(0);
-  }
+  // Aplicar filtros de alcance (nexp o teléfono concreto)
+  let filasFiltradas = [...filas];
+  if (soloNexp)     filasFiltradas = filasFiltradas.filter(f => f.nexp === soloNexp);
+  if (soloTelefono) filasFiltradas = filasFiltradas.filter(f => f.telefono === normalizePhone(soloTelefono));
 
-  if (arg === '--list') {
-    console.log('\n📋 Siniestros:\n');
-    siniestros.forEach((s, i) => {
-      console.log(`  ${i + 1}. [${s.nexp}] ${s.nombre} — ${s.causa} — Tel: ${maskPhone(s.telefono)} — ${s.estado}`);
-    });
-    process.exit(0);
-  }
+  console.log(`📊 Filas a evaluar: ${filasFiltradas.length}`);
+  console.log('');
 
-  if (arg === '--all') {
-    const pendientes = siniestros.filter(s => String(s.estado || '').toUpperCase() === 'OK');
-    console.log(`\n📤 Enviando a ${pendientes.length} siniestros...\n`);
+  const resultados = { ok: 0, error: 0, omitidos: 0 };
 
-    let ok = 0, fail = 0;
+  for (const fila of filasFiltradas) {
+    const { nexp, telefono, nombre, aseguradora, causa, observaciones } = fila;
+    // Si la causa está vacía, usar las observaciones como fallback (truncadas a 60 car.)
+    const causaTemplate = (causa || observaciones)
+      .replace(/[\r\n\t]+/g, ' ')   // sin saltos de línea ni tabuladores
+      .replace(/ {5,}/g, '    ')    // máximo 4 espacios consecutivos
+      .trim()
+      .slice(0, 60);
+    const waId = telefono;
 
-    for (const s of pendientes) {
-      try {
-        await sendInitial(s);
-        ok++;
-        await new Promise(r => setTimeout(r, 2000));
-      } catch (e) {
-        fail++;
-
-        // ✅ LOG DETALLADO (por siniestro)
-        const metaError = e?.response?.data?.error;
-        const metaMsg = metaError?.message || '';
-        const metaDetails = metaError?.error_data?.details || '';
-        console.error(`\n❌ ERROR en [${s.nexp}] Tel:${maskPhone(s.telefono)} Nombre:"${s.nombre}"`);
-        console.error(`   Meta msg: ${metaMsg}`);
-        if (metaDetails) console.error(`   Meta details: ${metaDetails}`);
-        console.error('   Raw:', e?.response?.data || e.message);
-        console.error('');
-      }
+    // Saltar filas cuyo estado no sea el esperado
+    if (fila.estado !== ESTADO_PENDIENTE) {
+      console.log(`⏭️  Fila ${fila.rowIndex} omitida — estado="${fila.estado || '(vacío)'}" | nexp=${nexp}`);
+      resultados.omitidos++;
+      continue;
     }
 
-    console.log(`\n📊 Resultado: ${ok} enviados, ${fail} errores`);
-    process.exit(fail > 0 ? 1 : 0);
+    // Saltar filas sin teléfono válido
+    if (!telefono) {
+      console.log(`⏭️  Fila ${fila.rowIndex} omitida — sin teléfono válido "${fila.telefonoRaw}" | nexp=${nexp}`);
+      resultados.omitidos++;
+      continue;
+    }
+
+    console.log(`─────────────────────────────────────────`);
+    console.log(`📋 Expediente: ${nexp}`);
+    console.log(`📱 Número:     ${log.maskPhone(waId)}`);
+    console.log(`👤 Asegurado:  ${nombre}`);
+    console.log(`🏢 Aseguradora: ${aseguradora}`);
+    console.log(`🔥 Causa:      ${causa}`);
+
+    // 1. Registrar conversación vinculando waId → nexp (estado inicial en Excel)
+    const INITIAL_RETRY_MS = Number(
+      process.env.INITIAL_RETRY_INTERVAL_MINUTES ||
+      (process.env.INITIAL_RETRY_INTERVAL_HOURS || 6) * 60
+    ) * 60000;
+    if (!dryRun) {
+      conversationManager.createOrUpdateConversation(waId, {
+        stage:              'consent',
+        attempts:           0,
+        inactivityAttempts: 0,
+        mensajes:           [],
+        contacto:           'En curso',
+        lastMessageAt:      Date.now(),
+        lastUserMessageAt:  null,   // resetear para que el scheduler detecte scenario A
+        lastReminderAt:     null,
+        nextReminderAt:     Date.now() + INITIAL_RETRY_MS,
+      });
+    }
+
+    // 3. Enviar plantilla inicial
+    if (dryRun) {
+      console.log(`🔵 [DRY-RUN] Enviaría plantilla "inicio" a ${waId}`);
+      resultados.ok++;
+    } else {
+      try {
+        await sendInitialTemplate(waId, 'inicio', { aseguradora, nexp, causa: causaTemplate });
+        console.log(`✅ Plantilla enviada correctamente`);
+        resultados.ok++;
+        await sleep(SEND_DELAY_MS);
+      } catch (err) {
+        console.error(`❌ Error enviando a ${log.maskPhone(waId)}:`, err.response?.data?.error?.message || err.message);
+        resultados.error++;
+      }
+    }
+    console.log('');
   }
 
-  const siniestro = siniestros.find(s => s.nexp === arg);
-  if (!siniestro) {
-    console.error(`❌ No se encontró encargo "${arg}"`);
-    console.log('💡 Disponibles:', siniestros.map(s => s.nexp).join(', '));
-    process.exit(1);
-  }
+  // ── Resumen ──────────────────────────────────────────────────────────────
+  console.log('╔════════════════════════════════════════════════════════════╗');
+  console.log('║                    RESUMEN FINAL                          ║');
+  console.log('╚════════════════════════════════════════════════════════════╝');
+  console.log(`✅ Enviados correctamente: ${resultados.ok}`);
+  console.log(`❌ Errores:                ${resultados.error}`);
+  console.log(`⏭️  Omitidos:               ${resultados.omitidos}`);
+  console.log('');
 
-  await sendInitial(siniestro);
+  return resultados;
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch(error => {
-    console.error('💥', error?.response?.data || error.message);
+// ── Utilidad para buildVerificationText (compatibilidad con código existente) ──
+
+function getSaludo() {
+  return buildSaludoByHour();
+}
+
+async function buildVerificationText(siniestro, saludo) {
+  const { aseguradora, nexp, causa, direccion, cp, municipio } = siniestro;
+  return (
+    `${saludo}, le contactamos desde el Gabinete Pericial Jumar en relación a su siniestro.\n\n` +
+    `• Aseguradora: ${aseguradora}\n` +
+    `• Expediente:  ${nexp}\n` +
+    `• Causa:       ${causa}\n` +
+    `• Dirección:   ${direccion}, ${cp} ${municipio}\n\n` +
+    `¿Desea continuar la gestión por este medio?`
+  );
+}
+
+// ── Ejecución directa ─────────────────────────────────────────────────────
+// node src/sendInitialMessage.js
+// node src/sendInitialMessage.js --dry-run
+// node src/sendInitialMessage.js --nexp 880337292
+// node src/sendInitialMessage.js --tel 674742564
+
+if (require.main === module) {
+  const args = process.argv.slice(2);
+  const dryRun = args.includes('--dry-run');
+  const nexpIdx = args.indexOf('--nexp');
+  const telIdx  = args.indexOf('--tel');
+
+  sendInitialMessages({
+    dryRun,
+    soloNexp:     nexpIdx  !== -1 ? args[nexpIdx  + 1] : null,
+    soloTelefono: telIdx   !== -1 ? args[telIdx   + 1] : null,
+  }).catch(err => {
+    console.error('❌ Error fatal:', err);
     process.exit(1);
   });
+}
+
+module.exports = { sendInitialMessages, readExcel, normalizePhone, getSaludo, buildVerificationText };

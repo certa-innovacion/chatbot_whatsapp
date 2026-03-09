@@ -1,186 +1,160 @@
-// src/ai/aiModel.js — v4 (simplificado)
-// La lógica del flujo está en messageHandler.js
-// Este módulo se encarga de:
-// 1. Analizar urgencia con Gemini (Paso 3 silencioso)
-// 2. Cargar base de conocimiento desde docs/
-const { GoogleGenerativeAI } = require('@google/generative-ai');
+const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
 const mammoth = require('mammoth');
-const fs = require('fs').promises;
 const path = require('path');
 
-// ─── Lazy init ───────────────────────────────────────────────────────────
-let genAI = null;
-let model = null;
+const PROMPT_PATH = path.join(__dirname, '..', '..', 'docs', 'pront', 'Promp IA Whatsapp.docx');
+let instruccionesBase = '';
+let client = null;
 
-function getModel() {
-  if (!model) {
-    const apiKey = process.env.GEMINI_API_KEY;
-    if (!apiKey) throw new Error('❌ Falta GEMINI_API_KEY en .env');
+// ── Gestión de modelos con fallback ──────────────────────────────────────────
 
-    genAI = new GoogleGenerativeAI(apiKey);
-    model = genAI.getGenerativeModel({
-      model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
-      generationConfig: {
-        temperature: Number(process.env.GEMINI_TEMPERATURE) || 0.3,
-        maxOutputTokens: 200,
-      },
-    });
-  }
-  return model;
+const MODEL_RESET_MS = 5 * 60 * 1000; // intentar volver al principal cada 5 min
+let activeModelIdx = 0;
+let lastSwitchAt = 0;
+
+function getModelList() {
+  const primary = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
+  const fallbacks = (process.env.GEMINI_MODEL_FALLBACKS || 'gemini-1.5-flash,gemini-1.5-flash-8b')
+    .split(',').map(m => m.trim()).filter(Boolean);
+  return [primary, ...fallbacks];
 }
 
-// ─── Base de conocimiento ────────────────────────────────────────────────
-let KNOWLEDGE_BASE = '';
-let IS_INITIALIZED = false;
+function currentModel() {
+  const models = getModelList();
+  if (activeModelIdx > 0 && Date.now() - lastSwitchAt > MODEL_RESET_MS) {
+    activeModelIdx = 0;
+    console.log(`🔄 Volviendo al modelo principal: ${models[0]}`);
+  }
+  return models[activeModelIdx];
+}
 
-async function loadKnowledgeBase() {
-  if (IS_INITIALIZED) return KNOWLEDGE_BASE;
+function isOverloaded(error) {
+  const msg = String(error?.message || '');
+  return error?.status === 429 ||
+    msg.includes('429') ||
+    msg.includes('RESOURCE_EXHAUSTED') ||
+    msg.includes('overloaded');
+}
 
-  const documentsPath = path.join(__dirname, '..', '..', 'docs');
+function tryNextModel() {
+  const models = getModelList();
+  if (activeModelIdx + 1 < models.length) {
+    activeModelIdx++;
+    lastSwitchAt = Date.now();
+    console.warn(`⚠️  Modelo saturado. Cambiando a: ${models[activeModelIdx]}`);
+    return true;
+  }
+  console.error('❌ Todos los modelos Gemini están saturados.');
+  return false;
+}
 
-  try {
-    await fs.access(documentsPath);
-    const files = await fs.readdir(documentsPath);
-    const docxFiles = files.filter(f => f.endsWith('.docx'));
-
-    if (docxFiles.length === 0) {
-      console.warn('⚠️  No hay .docx en docs/');
-      IS_INITIALIZED = true;
-      return KNOWLEDGE_BASE;
-    }
-
-    let kb = '';
-    for (const file of docxFiles) {
-      try {
-        const result = await mammoth.extractRawText({ path: path.join(documentsPath, file) });
-        kb += `\n--- ${file} ---\n${result.value}\n`;
-      } catch (e) {
-        console.error(`❌ Error leyendo ${file}:`, e.message);
+const schema = {
+  type: SchemaType.OBJECT,
+  properties: {
+    mensaje_para_usuario: { type: SchemaType.STRING },
+    mensaje_entendido: { 
+      type: SchemaType.BOOLEAN, 
+      description: "true si el mensaje tiene sentido, false si es ruido o ininteligible" 
+    },
+    datos_extraidos: {
+      type: SchemaType.OBJECT,
+      properties: {
+        asegurado_confirmado: { type: SchemaType.BOOLEAN },
+        nombre_contacto: { type: SchemaType.STRING },
+        relacion_contacto: { type: SchemaType.STRING },
+        telefono_contacto: { type: SchemaType.STRING },
+        importe_estimado: { type: SchemaType.STRING },
+        acepta_videollamada: { type: SchemaType.BOOLEAN },
+        preferencia_horaria: { type: SchemaType.STRING },
+        estado_expediente: { type: SchemaType.STRING, enum: ["identificacion", "valoracion", "agendando", "finalizado", "escalado_humano"] }
       }
     }
-
-    KNOWLEDGE_BASE = kb;
-    IS_INITIALIZED = true;
-    console.log(`✅ Base de conocimiento cargada: ${docxFiles.length} docs, ${kb.length} chars`);
-  } catch {
-    console.warn('⚠️  Carpeta docs/ no encontrada');
-    IS_INITIALIZED = true;
-  }
-
-  return KNOWLEDGE_BASE;
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// ANÁLISIS DE URGENCIA (Paso 3 — silencioso, el usuario no lo ve)
-// ═══════════════════════════════════════════════════════════════════════════
-
-/**
- * Usa Gemini para decidir si el siniestro es urgente.
- * @param {object} userData - Datos del siniestro
- * @returns {{ urgente: boolean, motivo: string }}
- */
-async function analyzeUrgency(userData) {
-  try {
-    const prompt = `Eres un perito de seguros. Analiza los datos de este siniestro y decide si es URGENTE o no.
-
-DATOS DEL SINIESTRO:
-- Causa: ${userData.causa || 'No especificada'}
-- Nombre: ${userData.nombre || 'No especificado'}
-- Fecha siniestro: ${userData.fecha || 'No especificada'}
-- Aseguradora: ${userData.aseguradora || 'No especificada'}
-- Estimación daños: ${userData.estimacion_danos ? userData.estimacion_danos + '€' : 'No estimada'}
-
-CRITERIOS DE URGENCIA:
-- Daños por agua activos (fugas, goteras que continúan)
-- Siniestro que impide habitabilidad (sin calefacción, sin agua caliente, sin luz)
-- Daños estructurales
-- Riesgo para la seguridad de personas
-- Estimación de daños superior a 10.000€
-- Robo reciente (menos de 48h)
-
-Responde SOLO con un JSON válido, sin texto adicional:
-{
-  "urgente": true/false,
-  "motivo": "explicación breve"
-}`;
-
-    const result = await getModel().generateContent(prompt);
-    const text = result.response.text().trim();
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-
-    if (jsonMatch) {
-      const parsed = JSON.parse(jsonMatch[0]);
-      console.log(`🚨 Urgencia: ${parsed.urgente ? 'SÍ' : 'NO'} — ${parsed.motivo}`);
-      return {
-        urgente: !!parsed.urgente,
-        motivo: parsed.motivo || '',
-      };
-    }
-
-    throw new Error('No se pudo extraer JSON');
-  } catch (error) {
-    console.error('❌ Error analizando urgencia:', error.message);
-    // Fallback conservador: no marcar como urgente si hay error
-    return {
-      urgente: false,
-      motivo: 'Error en análisis de urgencia - revisión manual recomendada',
-    };
-  }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-// GENERAR RESPUESTA LIBRE CON IA (para recordatorios y casos especiales)
-// ═══════════════════════════════════════════════════════════════════════════
-
-async function generateResponse(promptText, context = {}) {
-  try {
-    await loadKnowledgeBase();
-
-    const fullPrompt = `Eres un asistente del Gabinete Pericial de Jumar Ingeniería, que trabaja con la aseguradora Allianz.
-
-REGLAS:
-- Tono profesional pero cercano
-- Tratamiento de "usted"
-- Máximo 3 líneas
-- Sin markdown, sin asteriscos, sin negritas
-- Usa "le escribimos" en vez de "le llamamos"
-- SOLO devuelve el mensaje final, sin explicaciones
-
-${KNOWLEDGE_BASE ? 'BASE DE CONOCIMIENTO:\n' + KNOWLEDGE_BASE.substring(0, 2000) : ''}
-
-CONTEXTO:
-${JSON.stringify(context, null, 2)}
-
-INSTRUCCIÓN:
-${promptText}
-
-RESPUESTA:`;
-
-    const result = await getModel().generateContent(fullPrompt);
-    let text = result.response.text().trim();
-
-    // Limpiar markdown
-    text = text.replace(/\*\*/g, '').replace(/\*/g, '').replace(/#{1,6}\s/g, '').replace(/`/g, '');
-    text = text.replace(/\n{3,}/g, '\n\n').trim();
-
-    if (!text) return 'Disculpe, ¿podría reformular su mensaje?';
-    return text;
-
-  } catch (error) {
-    console.error('❌ Error generando respuesta:', error.message);
-    return 'Disculpe, estoy teniendo un problema técnico momentáneo. ¿Podría intentarlo de nuevo?';
-  }
-}
-
-// ─── Inicialización ──────────────────────────────────────────────────────
-loadKnowledgeBase().then(() => {
-  console.log('✅ aiModel inicializado');
-}).catch(err => {
-  console.error('❌ Error init aiModel:', err.message);
-});
-
-module.exports = {
-  generateResponse,
-  analyzeUrgency,
-  loadKnowledgeBase,
+  },
+  required: ["mensaje_para_usuario", "mensaje_entendido", "datos_extraidos"]
 };
+
+async function initIA() {
+  if (!instruccionesBase) {
+    const result = await mammoth.extractRawText({ path: PROMPT_PATH });
+    instruccionesBase = result.value;
+  }
+  if (!client) client = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+}
+
+async function procesarConIA(historial, mensajeUsuario, contextoExtra, valoresExcel) {
+  await initIA();
+
+const reglasControl = `
+8. NOMBRE DEL ASEGURADO: El nombre exacto del asegurado en este expediente es "${valoresExcel.nombre}". Cuando debas confirmar la identidad del interlocutor, usa EXACTAMENTE este nombre, sin modificarlo ni inventarlo.
+   IMPORTANTE: El "expediente" es un número de referencia administrativo (como un código), NO es una persona. Nunca preguntes si alguien tiene relación "con el expediente" — solo puedes preguntar si el interlocutor ES el asegurado (${valoresExcel.nombre}) o qué relación tiene CON ESA PERSONA (familiar, representante, etc.).
+9. CAUSA DEL SINIESTRO: La causa registrada en el expediente es "{{causa}}". Si está vacía, dedúcela a partir de las observaciones del expediente: "{{observaciones}}". Usa esa deducción internamente para contextualizar la conversación, pero no la comuniques al asegurado a menos que sea relevante.
+10. DATOS CORREGIDOS POR EL ASEGURADO: si el asegurado corrige dirección, causa u otro dato del expediente, da ese dato por válido y actualizado. No vuelvas a pedir confirmación de ese mismo dato en turnos posteriores (no repetir "¿es correcto?") salvo que quede ambiguo o incompleto.
+11. RELACIÓN YA INFORMADA: si el usuario ya indicó su relación con el asegurado (por ejemplo "soy su hermano"), no vuelvas a preguntarla. Pide solo el dato que falte.
+11.b CAMPO "relacion_contacto": cuando el usuario responde a la pregunta de relación con el asegurado, rellena este campo con esa relación.
+12. ESTIMACIÓN YA INFORMADA: si el usuario ya dio estimación económica, no la vuelvas a solicitar ni reformular.
+13. CAMPOS DE CONTACTO PARA "AT. Perito": cuando el asegurado indique quién atenderá al perito, rellena:
+   - nombre_contacto: nombre de esa persona.
+   - relacion_contacto: relación de esa persona con el asegurado (ej.: prima, marido, inquilino, empleado).
+   - telefono_contacto: teléfono de esa persona si lo facilita.
+14. VIDEOPERITACIÓN: solo explica qué es y cómo funciona si el usuario expresa dudas o lo pide. Si no hay dudas, pregunta directamente disponibilidad (mañana o tarde).
+15. FORMATO DE SALIDA: responde siempre en texto plano. Para listas usa líneas con viñetas "•". Nunca uses etiquetas HTML como <ul>, <li>, <br>, <p>.
+16. CAMPO "preferencia_horaria": rellénalo SOLO cuando el asegurado exprese claramente su preferencia horaria para la visita del perito. Usa el valor "mañana" si prefiere horario de mañana, o "tarde" si prefiere horario de tarde. Déjalo vacío ("") si aún no lo ha indicado.
+17. CAMPO "estado_expediente": debes rellenarlo en cada respuesta siguiendo estos criterios, independientemente del idioma de la conversación:
+   - "identificacion": mientras estás verificando identidad, datos del siniestro o dirección.
+   - "valoracion": cuando estás recogiendo información sobre los daños, estimación económica o idoneidad para videoperitación.
+   - "agendando": cuando estás coordinando la preferencia horaria para la visita.
+   - "finalizado": SOLO cuando hayas enviado el mensaje de cierre definitivo tras confirmar el resumen final con el asegurado. A partir de ese momento, no hay nada más que gestionar.
+   - "escalado_humano": SOLO cuando hayas confirmado expresamente al asegurado que el perito le llamará por petición suya de hablar con una persona.
+`;
+
+  const reglasReplaced = reglasControl
+    .replace(/{{causa}}/g, valoresExcel.causa)
+    .replace(/{{observaciones}}/g, valoresExcel.observaciones || '');
+
+  const promptFinal = instruccionesBase
+    .replace(/{{saludo}}/g, valoresExcel.saludo)
+    .replace(/{{aseguradora}}/g, valoresExcel.aseguradora)
+    .replace(/{{nexp}}/g, valoresExcel.nexp)
+    .replace(/{{causa}}/g, valoresExcel.causa)
+    .replace(/{{direccion}}/g, valoresExcel.direccion)
+    .replace(/{{cp}}/g, valoresExcel.cp)
+    .replace(/{{municipio}}/g, valoresExcel.municipio)
+    + reglasReplaced;
+
+  let validHistory = [...historial];
+  while (validHistory.length > 0 && validHistory[0].role === 'model') validHistory.shift();
+
+  const models = getModelList();
+  for (let attempt = 0; attempt <= models.length; attempt++) {
+    const modelName = currentModel();
+    try {
+      console.log(`🤖 Usando modelo: ${modelName}`);
+      const model = client.getGenerativeModel({
+        model: modelName,
+        systemInstruction: promptFinal,
+        generationConfig: { responseMimeType: "application/json", responseSchema: schema, temperature: process.env.GEMINI_TEMPERATURE }
+      });
+
+      const chat = model.startChat({ history: validHistory });
+      const result = await chat.sendMessage(`${contextoExtra}\n\nUsuario: ${mensajeUsuario}`);
+      return JSON.parse(result.response.text());
+
+    } catch (error) {
+      if (isOverloaded(error)) {
+        if (!tryNextModel()) break;
+        // reintentar con el siguiente modelo
+      } else {
+        console.error(`❌ Error en Gemini (${modelName}):`, error.message);
+        break;
+      }
+    }
+  }
+
+  return {
+    mensaje_para_usuario: "Disculpe, no he podido procesar correctamente su último mensaje. ¿Podría repetirlo?",
+    mensaje_entendido: false,
+    datos_extraidos: { estado_expediente: "identificacion" }
+  };
+}
+
+module.exports = { procesarConIA };

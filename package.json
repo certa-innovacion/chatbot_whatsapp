@@ -4,11 +4,15 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "node src/bot/index.js",
+    "start": "USE_AI_FLOW_MESSAGES=0 USE_AI_INITIAL_MESSAGE=0 node src/bot/index.js",
+    "start:ngrok": "STARTUP_SET_WEBHOOK=0 USE_AI_FLOW_MESSAGES=0 USE_AI_INITIAL_MESSAGE=0 node src/bot/index.js",
     "dev": "nodemon src/bot/index.js",
+    "webhook:ngrok": "bash scripts/ngrok_webhook.sh",
+    "webhook:ngrok:status": "bash scripts/ngrok_webhook.sh status",
+    "webhook:ngrok:stop": "bash scripts/ngrok_webhook.sh stop",
+    "peritoline:sync": "node scripts/peritoline_sync.js",
     "test": "echo \"Error: no test specified\" && exit 1",
-    "send": "node src/sendInitialMessage.js",
-    "list-templates": "node src/listTemplates.js"
+    "send": "node src/sendInitialMessage.js"
   },
   "repository": {
     "type": "git",
@@ -22,6 +26,7 @@
   },
   "homepage": "https://github.com/aletubiojumar/chatbot_whatsapp#readme",
   "dependencies": {
+    "@google/genai": "^1.41.0",
     "@google/generative-ai": "^0.24.1",
     "axios": "^1.13.4",
     "body-parser": "^2.2.1",
@@ -29,11 +34,13 @@
     "express": "^5.2.1",
     "mammoth": "^1.11.0",
     "node-cron": "^4.2.1",
-    "twilio": "^5.11.1",
+    "pdfjs-dist": "^4.4.168",
+    "pdfkit": "^0.17.2",
     "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "ngrok": "^5.0.0-beta.2",
-    "nodemon": "^3.1.11"
+    "nodemon": "^3.1.11",
+    "playwright": "^1.52.0"
   }
 }
