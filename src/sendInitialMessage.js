@@ -73,9 +73,10 @@ function readExcel(filePath) {
     direccion:     String(row['Dirección']      || '').trim(),
     cp:            String(row['CP']             || '').trim(),
     municipio:     String(row['Municipio']      || '').trim(),
-    telefonoRaw:   row['Telefono'] || row['Teléfono'] || '',
-    telefono:      normalizePhone(row['Telefono'] || row['Teléfono']),
-    estado:        String(row['Estado']         || '').trim().toUpperCase(),
+    telefonoRaw:    row['Telefono'] || row['Teléfono'] || '',
+    telefono:       normalizePhone(row['Telefono'] || row['Teléfono']),
+    estado:         String(row['Estado']          || '').trim().toUpperCase(),
+    peritovirtual:  String(row['Peritovirtual'] || row['peritovirtual'] || row['PeritorVirtual'] || '').trim().toLowerCase(),
   }));
 }
 
@@ -134,6 +135,13 @@ async function sendInitialMessages(opts = {}) {
     // Saltar filas cuyo estado no sea el esperado
     if (fila.estado !== ESTADO_PENDIENTE) {
       console.log(`⏭️  Fila ${fila.rowIndex} omitida — estado="${fila.estado || '(vacío)'}" | nexp=${nexp}`);
+      resultados.omitidos++;
+      continue;
+    }
+
+    // Saltar filas sin perito virtual habilitado
+    if (fila.peritovirtual !== 'si') {
+      console.log(`⏭️  Fila ${fila.rowIndex} omitida — PeritorVirtual="${fila.peritovirtual || '(vacío)'}" | nexp=${nexp}`);
       resultados.omitidos++;
       continue;
     }

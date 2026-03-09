@@ -30,6 +30,7 @@ const HEADLESS = /^(1|true|yes)$/i.test(String(process.env.PLAYWRIGHT_HEADLESS |
 const SLOW_MO = Number(process.env.PLAYWRIGHT_SLOW_MO || 80);
 const TIMEOUT_MS = Number(process.env.PLAYWRIGHT_TIMEOUT_MS || 25000);
 const DRY_RUN = /^(1|true|yes)$/i.test(String(process.env.PERITOLINE_DRY_RUN || 'false'));
+const VIRTUAL_PERITO_NAME = String(process.env.PERITOLINE_VIRTUAL_PERITO_NAME || 'PERITOVIRTUALDESARRO').trim().toUpperCase();
 const LAUNCH_ARGS = (process.env.PLAYWRIGHT_LAUNCH_ARGS
   || '--no-sandbox,--disable-setuid-sandbox,--disable-dev-shm-usage,--disable-breakpad,--disable-crash-reporter')
   .split(',')
@@ -488,16 +489,107 @@ async function uploadPdfToEncargo(page, encargo) {
   console.log(`📤 PDF subido: conversation_${encargo}.pdf`);
 }
 
+async function saveDebugSnapshot(page, label) {
+  try {
+    const logsDir = path.join(__dirname, '..', 'logs');
+    if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+    const base = path.join(logsDir, `debug_${label}_${Date.now()}`);
+    await page.screenshot({ path: `${base}.png`, fullPage: true });
+    fs.writeFileSync(`${base}.html`, await page.content());
+    console.log(`🔍 Debug snapshot guardado: ${base}.png`);
+  } catch (e) {
+    console.warn('No se pudo guardar snapshot de debug:', e.message);
+  }
+}
+
+async function asignarPerito(page, peritoName) {
+  // Si ya hay perito asignado, no hacer nada
+  const sinPerito = page.locator('button, a, span').filter({ hasText: /sin perito asignado/i }).first();
+  if (!(await sinPerito.isVisible().catch(() => false))) {
+    console.log('ℹ️  Perito ya asignado; se omite reasignación.');
+    return;
+  }
+
+  // Click en el botón "→ Asignar" del bloque PERITO/S.
+  // IMPORTANTE: excluir los enlaces de navegación "Asignar Encargos" del menú superior.
+  const asignarClicked = await clickFirstExisting([
+    // Botón/enlace cuyo texto es exactamente "Asignar" (o "→ Asignar") — sin "Encargos"
+    page.locator('a, button').filter({ hasText: /asignar/i }).filter({ hasNotText: /encargos|autos|diversos/i }),
+    // Elementos con onclick que mencionen asignar (los del menú no tienen onclick)
+    page.locator('[onclick*="asignar" i]'),
+  ]);
+  if (!asignarClicked) throw new Error('No se encontró el botón "Asignar" en sección PERITO/S');
+
+  // Dar tiempo a que abra el modal
+  await page.waitForTimeout(2000);
+
+  // Detectar el modal con selectores amplios
+  const modalCandidates = [
+    page.locator('.modal-dialog').filter({ hasText: /asignar perito/i }),
+    page.locator('div[role="dialog"]').filter({ hasText: /asignar perito/i }),
+    page.locator('.ui-dialog').filter({ hasText: /asignar perito/i }),
+    page.locator('.modal-dialog:visible'),
+    page.locator('div[role="dialog"]:visible'),
+    page.locator('.ui-dialog:visible'),
+    page.locator('.modal:visible'),
+    page.locator('[class*="modal"]:visible'),
+    page.locator('[class*="dialog"]:visible'),
+    page.locator('[class*="popup"]:visible'),
+    page.locator('[class*="overlay"]:visible'),
+  ];
+
+  const modalVisible = await waitAnyVisible(modalCandidates, TIMEOUT_MS);
+  if (!modalVisible) {
+    await saveDebugSnapshot(page, 'asignar_perito');
+    throw new Error('No apareció modal de asignación de perito. Revisa el snapshot en logs/');
+  }
+
+  // Tomar el primer modal visible como referencia
+  let modal = null;
+  for (const loc of modalCandidates) {
+    if ((await loc.count()) && (await loc.first().isVisible().catch(() => false))) {
+      modal = loc.first();
+      break;
+    }
+  }
+
+  // Localizar la fila del perito y seleccionar su radio
+  const peritoRow = modal.locator('tr').filter({ hasText: peritoName }).first();
+  await peritoRow.waitFor({ state: 'visible', timeout: TIMEOUT_MS });
+  const radio = peritoRow.locator('input[type="radio"]').first();
+  await radio.click({ force: true });
+  await page.waitForTimeout(300);
+
+  // Aceptar
+  const aceptarClicked = await clickFirstExisting([
+    modal.getByRole('button', { name: /aceptar/i }),
+    modal.locator('button:has-text("Aceptar"), a:has-text("Aceptar")'),
+    page.getByRole('button', { name: /aceptar/i }),
+  ]);
+  if (!aceptarClicked) throw new Error('No se encontró "Aceptar" en modal de asignación de perito');
+  await modal.waitFor({ state: 'hidden', timeout: TIMEOUT_MS }).catch(() => {});
+  console.log(`👷 Perito "${peritoName}" asignado correctamente`);
+}
+
 async function processTask(page, task) {
   const shouldFail = task.contacto === 'no';
   await openByEncargo(page, task.encargo);
   await addObservacionesEspeciales(page, task.observacionesEspeciales);
   // PeritoLine puede redirigir al dashboard al guardar — reabrimos el encargo
   await openByEncargo(page, task.encargo);
-  const modal = await openContactoModal(page, { allowMissing: !shouldFail });
-  if (modal) {
-    await setContactoFallido(modal, shouldFail);
-    await acceptModal(modal);
+  // Asignar perito virtual antes de marcar contacto (PeritoLine lo requiere)
+  if (task.contacto === 'si' && VIRTUAL_PERITO_NAME) {
+    await asignarPerito(page, VIRTUAL_PERITO_NAME);
+    await openByEncargo(page, task.encargo);
+  }
+  try {
+    const modal = await openContactoModal(page, { allowMissing: !shouldFail });
+    if (modal) {
+      await setContactoFallido(modal, shouldFail);
+      await acceptModal(modal);
+    }
+  } catch (err) {
+    console.warn(`⚠️  Modal contacto omitido (probablemente ya marcado): ${err.message}`);
   }
   // Subir PDF de conversación (si existe)
   await uploadPdfToEncargo(page, task.encargo);

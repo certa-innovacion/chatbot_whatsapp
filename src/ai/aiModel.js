@@ -31,9 +31,14 @@ function currentModel() {
 function isOverloaded(error) {
   const msg = String(error?.message || '');
   return error?.status === 429 ||
+    error?.status === 503 ||
     msg.includes('429') ||
+    msg.includes('503') ||
     msg.includes('RESOURCE_EXHAUSTED') ||
-    msg.includes('overloaded');
+    msg.includes('overloaded') ||
+    msg.includes('high demand') ||
+    msg.includes('Service Unavailable') ||
+    msg.includes('UNAVAILABLE');
 }
 
 function tryNextModel() {
