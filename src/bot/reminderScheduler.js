@@ -116,7 +116,7 @@ async function handleInitialRetry(conv, now) {
 
   if (intentos >= INITIAL_MAX_ATTEMPTS) {
     // Ya se agotaron — escalar si no está marcado
-    await finalizar(waId, nexp);
+    await finalizar(waId, nexp, '[IA] Asegurado no responde');
     return;
   }
 
@@ -151,7 +151,7 @@ async function handleInactivity(conv, now) {
   const intentos = conv.inactivityAttempts || 0;
 
   if (intentos >= INACTIVITY_MAX) {
-    await finalizar(waId, nexp);
+    await finalizar(waId, nexp, '[IA] Asegurado deja de responder');
     return;
   }
 
@@ -196,14 +196,14 @@ async function handleInactivity(conv, now) {
     });
     console.log(`✅ Mensaje de inactividad enviado (${siguiente}/${INACTIVITY_MAX}): "${msgInactividad}"`);
     if (siguiente >= INACTIVITY_MAX) {
-      await finalizar(waId, nexp);
+      await finalizar(waId, nexp, '[IA] Asegurado deja de responder');
     }
   } catch (err) {
     console.error(`❌ Error enviando inactividad ${waId}:`, err.message);
   }
 }
 
-async function finalizar(waId, nexp) {
+async function finalizar(waId, nexp, anotacion = '') {
   try {
     const conv = conversationManager.getConversation(waId);
     const mensajes = conversationManager.getMensajes(waId);
@@ -230,7 +230,7 @@ async function finalizar(waId, nexp) {
       stage:    'cerrado',
       contacto: 'No',
     });
-    triggerEncargoSync(nexp, 'inactividad_contacto_no');
+    triggerEncargoSync(nexp, 'inactividad_contacto_no', anotacion);
     console.log(`🚨 Escalado por inactividad: nexp=${nexp}`);
 
     // Generar PDF de transcripción al cerrar por inactividad

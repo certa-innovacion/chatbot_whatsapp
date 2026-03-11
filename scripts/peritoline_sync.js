@@ -38,11 +38,15 @@ const LAUNCH_ARGS = (process.env.PLAYWRIGHT_LAUNCH_ARGS
   .filter(Boolean);
 
 function parseArgs(argv) {
-  const out = { encargo: null };
+  const out = { encargo: null, anotacion: '' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--encargo' && argv[i + 1]) {
       out.encargo = String(argv[i + 1]).trim();
+      i++;
+    }
+    if (arg === '--anotacion' && argv[i + 1]) {
+      out.anotacion = String(argv[i + 1]).trim();
       i++;
     }
   }
@@ -88,6 +92,7 @@ function buildObservacionesEspecialesText(row) {
 
 function readTasksFromExcel(filePath, opts = {}) {
   const targetEncargo = String(opts.encargo || '').trim();
+  const anotacion = String(opts.anotacion || '').trim();
   const wb = XLSX.readFile(filePath);
   const ws = wb.Sheets[wb.SheetNames[0]];
   const rows = XLSX.utils.sheet_to_json(ws, { defval: '' });
@@ -107,6 +112,7 @@ function readTasksFromExcel(filePath, opts = {}) {
       encargo,
       contacto,
       observacionesEspeciales: buildObservacionesEspecialesText(row),
+      anotacion,
     });
   }
   return tasks;
@@ -571,6 +577,36 @@ async function asignarPerito(page, peritoName) {
   console.log(`👷 Perito "${peritoName}" asignado correctamente`);
 }
 
+async function addAnotacionEncargo(page, text) {
+  if (!text) return;
+  const truncated = text.slice(0, 128);
+
+  const candidates = [
+    page.locator('textarea[maxlength="128"]').first(),
+    page.locator('xpath=//*[contains(translate(normalize-space(.), "ANOTACI\u00d3N", "anotaci\u00f3n"), "anotaci") and contains(translate(normalize-space(.), "ENCARGO", "encargo"), "encargo")]/following::textarea[1]'),
+    page.locator('textarea[name*="anotacion" i], textarea[id*="anotacion" i]'),
+  ];
+
+  for (const candidate of candidates) {
+    if (!(await candidate.count())) continue;
+    const el = candidate.first();
+    if (!(await el.isVisible().catch(() => false))) continue;
+    await el.scrollIntoViewIfNeeded().catch(() => {});
+    await el.click({ force: true });
+    await el.fill(truncated);
+    await el.evaluate(node => {
+      node.dispatchEvent(new Event('input', { bubbles: true }));
+      node.dispatchEvent(new Event('change', { bubbles: true }));
+      node.dispatchEvent(new Event('blur',   { bubbles: true }));
+    });
+    await page.waitForTimeout(300);
+    console.log(`📝 Anotación encargo escrita: "${truncated}"`);
+    return;
+  }
+
+  console.warn('⚠️  No se encontró el campo "Anotación Encargo 01" — se omite anotación');
+}
+
 async function processTask(page, task) {
   const shouldFail = task.contacto === 'no';
   await openByEncargo(page, task.encargo);
@@ -582,6 +618,8 @@ async function processTask(page, task) {
     await asignarPerito(page, VIRTUAL_PERITO_NAME);
     await openByEncargo(page, task.encargo);
   }
+  // Escribir anotación del encargo (tipo de cita o motivo de cierre)
+  await addAnotacionEncargo(page, task.anotacion);
   try {
     const modal = await openContactoModal(page, { allowMissing: !shouldFail });
     if (modal) {
@@ -600,7 +638,7 @@ async function main() {
     throw new Error('Faltan LOGIN_URL / USERNAME / PASSWORD en .env');
   }
 
-  const tasks = readTasksFromExcel(EXCEL_PATH, { encargo: CLI.encargo });
+  const tasks = readTasksFromExcel(EXCEL_PATH, { encargo: CLI.encargo, anotacion: CLI.anotacion });
   if (!tasks.length) {
     console.log('ℹ️ No hay siniestros para procesar (solo se procesan Contacto = Sí/No).');
     return;

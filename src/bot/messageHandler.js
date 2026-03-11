@@ -371,7 +371,11 @@ async function processMessage(waId, messageObj) {
 
       // Disparo al cerrar conversación (principalmente para subir PDF).
       if (!isFirstResponse && excelUpdates.contacto === 'Sí' && (stageAplicado === 'finalizado' || stageAplicado === 'escalated')) {
-        triggerEncargoSync(nexp, `stage_${stageAplicado}`);
+        const digitalVal = excelUpdates.digital || conversation.digital;
+        let anotacion = '';
+        if (digitalVal === 'Sí') anotacion = '[IA] Digital: Sí';
+        else if (digitalVal === 'No') anotacion = '[IA] Digital: No';
+        triggerEncargoSync(nexp, `stage_${stageAplicado}`, anotacion);
       }
 
       // Generar PDF de transcripción al finalizar la conversación
