@@ -10,24 +10,11 @@ const AUTO_SYNC_COOLDOWN_MS = Number(process.env.PERITOLINE_AUTO_SYNC_COOLDOWN_M
 
 const running = new Set();
 const lastRunByEncargo = new Map();
+// Cola para syncs finales que llegaron mientras había una en curso
+const pendingFinal = new Map(); // key → { anotacion }
 
-function triggerEncargoSync(encargo, reason = '', anotacion = '', assignOnly = false, isFinalSync = false) {
-  const key = String(encargo || '').trim();
-  if (!key) return;
-  if (!AUTO_SYNC_ENABLED) return;
-
-  const now = Date.now();
-  const last = lastRunByEncargo.get(key) || 0;
-  if (running.has(key)) {
-    log.info(`⏭️  PeritoLine auto-sync omitido (ya en curso) | encargo=${key}`);
-    return;
-  }
-  if (now - last < AUTO_SYNC_COOLDOWN_MS) {
-    log.info(`⏭️  PeritoLine auto-sync omitido (cooldown) | encargo=${key}`);
-    return;
-  }
-
-  lastRunByEncargo.set(key, now);
+function _spawn(key, reason, anotacion, assignOnly, isFinalSync) {
+  lastRunByEncargo.set(key, Date.now());
   running.add(key);
 
   const scriptPath = path.join(__dirname, '..', '..', 'scripts', 'peritoline_sync.js');
@@ -52,6 +39,7 @@ function triggerEncargoSync(encargo, reason = '', anotacion = '', assignOnly = f
   child.on('error', (err) => {
     running.delete(key);
     log.error(`❌ Error lanzando PeritoLine auto-sync | encargo=${key}:`, err.message);
+    _drainPending(key);
   });
 
   child.on('exit', (code) => {
@@ -61,10 +49,45 @@ function triggerEncargoSync(encargo, reason = '', anotacion = '', assignOnly = f
     } else {
       log.error(`❌ PeritoLine auto-sync terminó con error | encargo=${key} | code=${code}`);
     }
+    _drainPending(key);
   });
 
-  // No bloquear el proceso principal del bot.
   child.unref();
+}
+
+function _drainPending(key) {
+  if (!pendingFinal.has(key)) return;
+  const { anotacion } = pendingFinal.get(key);
+  pendingFinal.delete(key);
+  log.info(`▶ Ejecutando final-sync pendiente | encargo=${key}`);
+  _spawn(key, 'pending_final', anotacion, false, true);
+}
+
+function triggerEncargoSync(encargo, reason = '', anotacion = '', assignOnly = false, isFinalSync = false) {
+  const key = String(encargo || '').trim();
+  if (!key) return;
+  if (!AUTO_SYNC_ENABLED) return;
+
+  if (running.has(key)) {
+    if (isFinalSync) {
+      // Guardar para ejecutar en cuanto termine el proceso actual
+      pendingFinal.set(key, { anotacion });
+      log.info(`⏳ PeritoLine final-sync encolado (sync en curso) | encargo=${key}`);
+    } else {
+      log.info(`⏭️  PeritoLine auto-sync omitido (ya en curso) | encargo=${key}`);
+    }
+    return;
+  }
+
+  // Los syncs finales omiten el cooldown (pueden llegar justo después de otra sync)
+  const now = Date.now();
+  const last = lastRunByEncargo.get(key) || 0;
+  if (!isFinalSync && now - last < AUTO_SYNC_COOLDOWN_MS) {
+    log.info(`⏭️  PeritoLine auto-sync omitido (cooldown) | encargo=${key}`);
+    return;
+  }
+
+  _spawn(key, reason, anotacion, assignOnly, isFinalSync);
 }
 
 module.exports = { triggerEncargoSync };
