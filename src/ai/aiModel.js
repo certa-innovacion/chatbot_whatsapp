@@ -14,7 +14,7 @@ let lastSwitchAt = 0;
 
 function getModelList() {
   const primary = process.env.GEMINI_MODEL || 'gemini-2.5-flash';
-  const fallbacks = (process.env.GEMINI_MODEL_FALLBACKS || 'gemini-2.0-flash,gemini-2.0-flash-lite')
+  const fallbacks = (process.env.GEMINI_MODEL_FALLBACKS || 'gemini-2.5-flash-lite,gemini-2.5-pro')
     .split(',').map(m => m.trim()).filter(Boolean);
   return [primary, ...fallbacks];
 }
@@ -46,16 +46,50 @@ function isOverloaded(error) {
     msg.includes('is not supported');
 }
 
-function tryNextModel() {
+function tryNextModel(reason = 'Modelo saturado') {
   const models = getModelList();
   if (activeModelIdx + 1 < models.length) {
     activeModelIdx++;
     lastSwitchAt = Date.now();
-    console.warn(`⚠️  Modelo saturado. Cambiando a: ${models[activeModelIdx]}`);
+    console.warn(`⚠️  ${reason}. Cambiando a: ${models[activeModelIdx]}`);
     return true;
   }
   console.error('❌ Todos los modelos Gemini están saturados.');
   return false;
+}
+
+function isJsonParseError(error) {
+  const msg = String(error?.message || '');
+  return error instanceof SyntaxError ||
+    msg.includes('Unexpected end of JSON input') ||
+    msg.includes('Unexpected token') ||
+    msg.includes('JSON');
+}
+
+function parseModelJsonResponse(rawText) {
+  const text = String(rawText || '').trim();
+  if (!text) throw new SyntaxError('Respuesta vacía del modelo');
+
+  const candidates = [text];
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced?.[1]) candidates.push(String(fenced[1]).trim());
+
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace >= 0 && lastBrace > firstBrace) {
+    candidates.push(text.slice(firstBrace, lastBrace + 1).trim());
+  }
+
+  let lastErr = null;
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    try {
+      return JSON.parse(candidate);
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr || new SyntaxError('No se pudo parsear JSON del modelo');
 }
 
 const schema = {
@@ -94,6 +128,7 @@ async function initIA() {
 
 async function procesarConIA(historial, mensajeUsuario, contextoExtra, valoresExcel) {
   await initIA();
+  const JSON_RETRIES_PER_MODEL = Math.max(0, Number(process.env.GEMINI_JSON_RETRIES_PER_MODEL || 1));
 
 const reglasControl = `
 8. NOMBRE DEL ASEGURADO: El nombre exacto del asegurado en este expediente es "${valoresExcel.nombre}". Cuando debas confirmar la identidad del interlocutor, usa EXACTAMENTE este nombre, sin modificarlo ni inventarlo.
@@ -139,7 +174,9 @@ const reglasControl = `
   while (validHistory.length > 0 && validHistory[0].role === 'model') validHistory.shift();
 
   const models = getModelList();
-  for (let attempt = 0; attempt <= models.length; attempt++) {
+  const jsonRetriesByModel = new Map();
+  const maxAttempts = Math.max(3, models.length * (JSON_RETRIES_PER_MODEL + 2));
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const modelName = currentModel();
     try {
       console.log(`🤖 Usando modelo: ${modelName}`);
@@ -151,15 +188,26 @@ const reglasControl = `
 
       const chat = model.startChat({ history: validHistory });
       const result = await chat.sendMessage(`${contextoExtra}\n\nUsuario: ${mensajeUsuario}`);
-      return JSON.parse(result.response.text());
+      return parseModelJsonResponse(result.response.text());
 
     } catch (error) {
+      if (isJsonParseError(error)) {
+        const usedRetries = jsonRetriesByModel.get(modelName) || 0;
+        if (usedRetries < JSON_RETRIES_PER_MODEL) {
+          jsonRetriesByModel.set(modelName, usedRetries + 1);
+          console.warn(`⚠️  JSON inválido en ${modelName} (${error.message}). Reintento ${usedRetries + 1}/${JSON_RETRIES_PER_MODEL}.`);
+          continue;
+        }
+        if (!tryNextModel('JSON inválido persistente')) break;
+        continue;
+      }
+
       if (isOverloaded(error)) {
-        if (!tryNextModel()) break;
+        if (!tryNextModel('Modelo saturado/no disponible')) break;
         // reintentar con el siguiente modelo
       } else {
         console.error(`❌ Error en Gemini (${modelName}):`, error.message);
-        break;
+        if (!tryNextModel('Error en el modelo actual')) break;
       }
     }
   }
@@ -173,4 +221,10 @@ const reglasControl = `
   };
 }
 
-module.exports = { procesarConIA };
+module.exports = {
+  procesarConIA,
+  _test: {
+    isJsonParseError,
+    parseModelJsonResponse,
+  },
+};
