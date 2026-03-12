@@ -738,6 +738,8 @@ async function desasignarPerito(page, peritoName) {
       if (!(await el.isVisible().catch(() => false))) continue;
       await el.scrollIntoViewIfNeeded().catch(() => {});
       await el.hover({ force: true }).catch(() => {});
+      // Algunas vistas muestran la opción de borrar en menú contextual.
+      await el.click({ button: 'right', force: true }).catch(() => {});
       await page.waitForTimeout(200);
       break;
     }
@@ -748,6 +750,8 @@ async function desasignarPerito(page, peritoName) {
     'xpath=//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ/ÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyz/áéíóúñ"), "perito/s")]/ancestor::*[self::td or self::div][1]'
   ).first();
   const removeCandidates = [
+    page.locator('ul.context-menu-list:visible li.context-menu-item:has(i.fa-times), ul.context-menu-list:visible li:has(i.fa-times)'),
+    page.locator('ul.context-menu-list:visible li.context-menu-item').filter({ hasText: new RegExp(`${escapeRegExp(peritoName)}|peritovirtual`, 'i') }),
     page.locator('.popover:visible a:has-text("×"), .popover:visible button:has-text("×"), .tooltip:visible a:has-text("×"), .tooltip:visible button:has-text("×"), .ui-tooltip:visible a:has-text("×"), .ui-tooltip:visible button:has-text("×")'),
     page.locator('.popover:visible a:has(i.fa-times), .popover:visible button:has(i.fa-times), .tooltip:visible a:has(i.fa-times), .tooltip:visible button:has(i.fa-times)'),
     peritoSection.locator('a:has-text("×"), button:has-text("×"), a:has(i.fa-times), button:has(i.fa-times), .btn-danger, .btn-warning'),
@@ -763,7 +767,7 @@ async function desasignarPerito(page, peritoName) {
 
   let clicked = await clickFirstExisting(removeCandidates);
 
-  // Fallback A: disparar click por JS en cualquier handler inline de borrado.
+  // Fallback A: ejecutar JS inline de borrado aunque el elemento esté oculto.
   if (!clicked) {
     clicked = await page.evaluate(() => {
       const all = Array.from(document.querySelectorAll('[onclick]'));
@@ -772,9 +776,125 @@ async function desasignarPerito(page, peritoName) {
         return (s.includes('encargo_perito') && s.includes('delete')) || s.includes('borrar_perito') || s.includes('eliminar_perito');
       });
       if (!target) return false;
+      const js = String(target.getAttribute('onclick') || '');
+      if (js) {
+        try {
+          // Ejecutar el código inline evita depender de hover/visibility.
+          // eslint-disable-next-line no-new-func
+          new Function(js).call(target);
+          return true;
+        } catch (_) {}
+      }
       target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
       return true;
     }).catch(() => false);
+  }
+
+  // Fallback B: click JS sobre item del context-menu (si quedó abierto).
+  if (!clicked) {
+    clicked = await page.evaluate((name) => {
+      const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+      const targetName = norm(name);
+      const items = Array.from(document.querySelectorAll('ul.context-menu-list li.context-menu-item'));
+      const visibleItems = items.filter((it) => {
+        const style = window.getComputedStyle(it);
+        return style && style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+      });
+      const best = visibleItems.find((it) => {
+        const txt = norm(it.textContent || '');
+        return txt.includes(targetName) || txt.includes('peritovirtual') || txt.includes('eliminar') || txt.includes('quitar');
+      }) || visibleItems.find((it) => {
+        const icon = it.querySelector('i.fa-times, i.far.fa-trash, i.fa-trash');
+        return Boolean(icon);
+      });
+      if (!best) return false;
+      best.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true, view: window }));
+      best.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true, view: window }));
+      best.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      return true;
+    }).catch(() => false);
+  }
+
+  // Fallback C: invocar función nativa de PeritoLine para borrar perito.
+  if (!clicked) {
+    clicked = await page.evaluate((name) => {
+      const norm = (s) => String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+      const targetName = norm(name);
+      const asNum = (v) => {
+        const n = Number(String(v || '').replace(/[^\d]/g, ''));
+        return Number.isFinite(n) && n > 0 ? n : 0;
+      };
+
+      if (typeof window.encargo_perito !== 'function') return false;
+
+      // 1) Reutilizar onclick ya construido por la propia vista, si existe.
+      const withOnclick = Array.from(document.querySelectorAll('[onclick]')).find((el) => {
+        const s = String(el.getAttribute('onclick') || '').toLowerCase();
+        return s.includes('encargo_perito') && s.includes('delete');
+      });
+      if (withOnclick) {
+        try {
+          // eslint-disable-next-line no-new-func
+          new Function(String(withOnclick.getAttribute('onclick') || '')).call(withOnclick);
+          return true;
+        } catch (_) {}
+      }
+
+      // 2) Construcción manual de parámetros mínimos.
+      let idEncargo = 0;
+      const idEncCandidates = [
+        ...Array.from(document.querySelectorAll('[name*="id_encargo" i], [id*="id_encargo" i], [data-idenc], [id^="td-idenc-"]')).map((el) => {
+          const raw = el.getAttribute('data-idenc')
+            || el.getAttribute('data-id-encargo')
+            || el.getAttribute('value')
+            || el.getAttribute('id')
+            || el.textContent
+            || '';
+          return asNum(raw);
+        }),
+      ].filter(Boolean);
+      if (idEncCandidates.length) idEncargo = idEncCandidates[0];
+
+      let idPerito = '';
+      const peritoInput = Array.from(document.querySelectorAll('input[readonly], input.perito')).find((el) => {
+        const t = norm(el.value || el.textContent || '');
+        return t.includes(targetName) || t.includes('peritovirtual');
+      });
+      if (peritoInput) idPerito = String(peritoInput.getAttribute('data-value') || '').trim();
+      if (!idPerito) {
+        const selectOpt = Array.from(document.querySelectorAll('select option:checked, select option[selected]')).find((opt) => {
+          const t = norm(opt.textContent || '');
+          return t.includes(targetName) || t.includes('peritovirtual');
+        });
+        if (selectOpt) idPerito = String(selectOpt.getAttribute('value') || '').trim();
+      }
+
+      let numEncargo = 1;
+      try {
+        const u = new URL(window.location.href);
+        const tabE = u.searchParams.get('tab_e') || '';
+        const m = tabE.match(/e(\d+)/i);
+        if (m) numEncargo = Number(m[1]) || 1;
+      } catch (_) {}
+
+      const refFromDom = (() => {
+        const txt = document.body?.innerText || '';
+        const m = txt.match(/ref[:\s]+([a-z0-9\-_/]+)/i);
+        return m ? m[1] : '';
+      })();
+
+      if (!idEncargo || !idPerito) return false;
+
+      try {
+        window.encargo_perito('delete', idEncargo, refFromDom || '', numEncargo || 1, 1, idPerito, 'siniestro');
+        return true;
+      } catch (_) {}
+      try {
+        window.encargo_perito('delete', idEncargo, refFromDom || '', numEncargo || 1, 1, idPerito, '');
+        return true;
+      } catch (_) {}
+      return false;
+    }, peritoName).catch(() => false);
   }
 
   if (clicked) {
