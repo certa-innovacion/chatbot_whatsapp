@@ -629,29 +629,57 @@ async function desasignarPerito(page, peritoName) {
     return;
   }
 
-  // Buscar botón de quitar/eliminar asociado al perito virtual.
-  // PeritoLine suele usar un cuadrado coloreado (btn-danger/btn-warning) o icono
-  // fa-minus / fa-times junto al nombre del perito en la sección PERITO/S.
-  const candidates = [
+  // Paso 1-2: ir a PERITO/S y hacer hover sobre el nombre para que aparezca la X.
+  const peritoLower = String(peritoName || '').trim().toLowerCase();
+  const hoverTargets = [
+    page.locator(`xpath=//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "${peritoLower}")]`),
+    page.locator('xpath=//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "peritovirtual")]'),
+  ];
+  for (const target of hoverTargets) {
+    const total = await target.count();
+    const limit = Math.min(total, 6);
+    for (let i = 0; i < limit; i++) {
+      const el = target.nth(i);
+      if (!(await el.isVisible().catch(() => false))) continue;
+      await el.scrollIntoViewIfNeeded().catch(() => {});
+      await el.hover({ force: true }).catch(() => {});
+      await page.waitForTimeout(200);
+      break;
+    }
+  }
+
+  // Paso 3: clicar la X de desasignar (menú flotante/popover) o fallback clásico.
+  const peritoSection = page.locator(
+    'xpath=//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ/ÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyz/áéíóúñ"), "perito/s")]/ancestor::*[self::td or self::div][1]'
+  ).first();
+  const removeCandidates = [
+    page.locator('.popover:visible a:has-text("×"), .popover:visible button:has-text("×"), .tooltip:visible a:has-text("×"), .tooltip:visible button:has-text("×"), .ui-tooltip:visible a:has-text("×"), .ui-tooltip:visible button:has-text("×")'),
+    page.locator('.popover:visible a:has(i.fa-times), .popover:visible button:has(i.fa-times), .tooltip:visible a:has(i.fa-times), .tooltip:visible button:has(i.fa-times)'),
+    peritoSection.locator('a:has-text("×"), button:has-text("×"), a:has(i.fa-times), button:has(i.fa-times), .btn-danger, .btn-warning'),
     page.locator(`tr:has-text("${peritoName}")`).locator('button, a').filter({ hasText: /quitar|eliminar|borrar|remove/i }),
     page.locator(`tr:has-text("${peritoName}")`).locator('[onclick*="quitar" i], [onclick*="eliminar" i], [onclick*="remove" i]'),
     page.locator(`tr:has-text("${peritoName}")`).locator('button:has(i.fa-minus), button:has(i.fa-times), button:has(i.fa-trash)'),
     page.locator(`tr:has-text("${peritoName}")`).locator('a:has(i.fa-minus), a:has(i.fa-times), a:has(i.fa-trash)'),
     page.locator(`tr:has-text("${peritoName}")`).locator('.btn-danger, .btn-warning'),
-    page.locator('[onclick*="quitar_perito" i], [onclick*="eliminar_perito" i]'),
-    page.locator('button:has-text("Quitar"), a:has-text("Quitar")'),
+    page.locator('[onclick*="quitar_perito" i], [onclick*="eliminar_perito" i], [onclick*="remove_perito" i]'),
+    page.locator('button:has-text("Quitar"), a:has-text("Quitar"), button:has-text("Eliminar"), a:has-text("Eliminar")'),
   ];
 
-  const clicked = await clickFirstExisting(candidates);
+  const clicked = await clickFirstExisting(removeCandidates);
   if (!clicked) {
     await saveDebugSnapshot(page, 'desasignar_perito');
     console.warn('⚠️  No se encontró botón para desasignar perito — revisa el snapshot en logs/');
     return;
   }
 
-  // Aceptar modal de confirmación si aparece
+  // Paso 4: confirmar en "Aceptar" del modal "ELIMINAR PERITO".
   await page.waitForTimeout(800);
-  const confirmModal = page.locator('.modal-dialog:visible, div[role="dialog"]:visible, .ui-dialog:visible').first();
+  let confirmModal = page.locator(
+    '.modal-dialog:has-text("ELIMINAR PERITO"), div[role="dialog"]:has-text("ELIMINAR PERITO"), .ui-dialog:has-text("ELIMINAR PERITO"), .modal-dialog:has-text("Eliminar perito"), div[role="dialog"]:has-text("Eliminar perito"), .ui-dialog:has-text("Eliminar perito")'
+  ).first();
+  if (!(await confirmModal.count()) || !(await confirmModal.isVisible().catch(() => false))) {
+    confirmModal = page.locator('.modal-dialog:visible, div[role="dialog"]:visible, .ui-dialog:visible').filter({ hasText: /eliminar.*perito|perito/i }).first();
+  }
   if (await confirmModal.count() && await confirmModal.isVisible().catch(() => false)) {
     await clickFirstExisting([
       confirmModal.getByRole('button', { name: /aceptar|confirmar|s[ií]/i }),
@@ -660,7 +688,10 @@ async function desasignarPerito(page, peritoName) {
     await confirmModal.waitFor({ state: 'hidden', timeout: TIMEOUT_MS }).catch(() => {});
   }
 
-  await page.waitForTimeout(500);
+  const sinPeritoVisible = await sinPerito.isVisible().catch(() => false);
+  if (!sinPeritoVisible) {
+    await page.waitForTimeout(500);
+  }
   console.log(`🗑️  Perito "${peritoName}" desasignado`);
 }
 
@@ -701,7 +732,7 @@ async function processTask(page, task) {
     // Subir PDF de transcripción
     await uploadPdfToEncargo(page, task.encargo);
     // Desasignar perito virtual — dejar el encargo sin asignación
-    if (doPerito) {
+    if (VIRTUAL_PERITO_NAME) {
       await openByEncargo(page, task.encargo);
       await desasignarPerito(page, VIRTUAL_PERITO_NAME);
     }

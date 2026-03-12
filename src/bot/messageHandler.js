@@ -379,8 +379,14 @@ async function processMessage(waId, messageObj) {
       // Disparo al cerrar conversación (principalmente para subir PDF).
       if (!isFirstResponse && excelUpdates.contacto === 'Sí' && (stageAplicado === 'finalizado' || stageAplicado === 'escalated')) {
         const digitalVal = excelUpdates.digital || conversation.digital;
+        const horarioVal = String(excelUpdates.horario || conversation.horario || '').trim().toLowerCase();
+        let horarioLabel = '';
+        if (horarioVal.includes('mañana') || horarioVal.includes('manana')) horarioLabel = 'Mañana';
+        else if (horarioVal.includes('tarde')) horarioLabel = 'Tarde';
         let anotacion = '';
-        if (digitalVal === 'Sí') anotacion = '[IA] Digital: Sí';
+        if (digitalVal === 'Sí') {
+          anotacion = horarioLabel ? `[IA] Digital: Sí (${horarioLabel})` : '[IA] Digital: Sí';
+        }
         else if (digitalVal === 'No') anotacion = '[IA] Digital: No';
         triggerEncargoSync(nexp, `stage_${stageAplicado}`, anotacion, false, true);
       }
