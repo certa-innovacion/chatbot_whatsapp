@@ -673,15 +673,7 @@ async function processTask(page, task) {
     await openByEncargo(page, task.encargo);
   }
 
-  // 3. Añadir observaciones especiales del siniestro
-  await addObservacionesEspeciales(page, task.observacionesEspeciales);
-  // PeritoLine puede redirigir al dashboard al guardar — reabrimos el encargo
-  await openByEncargo(page, task.encargo);
-
-  // 4. Escribir anotación del encargo (tipo de cita o motivo de cierre)
-  await addAnotacionEncargo(page, task.anotacion);
-
-  // 5. Marcar contacto
+  // 3. Marcar contacto (siempre: tanto en primera respuesta como al cierre)
   try {
     const modal = await openContactoModal(page, { allowMissing: !shouldFail });
     if (modal) {
@@ -692,9 +684,18 @@ async function processTask(page, task) {
     console.warn(`⚠️  Modal contacto omitido (probablemente ya marcado): ${err.message}`);
   }
 
-  // 6. Subir PDF + desasignar perito — solo en sync de cierre de conversación
+  // 4-6. Solo al cierre de conversación (datos ya completos)
   if (task.finalSync) {
+    // Observaciones especiales con los datos recogidos en la conversación completa
+    await openByEncargo(page, task.encargo);
+    await addObservacionesEspeciales(page, task.observacionesEspeciales);
+    // PeritoLine puede redirigir al dashboard al guardar — reabrimos el encargo
+    await openByEncargo(page, task.encargo);
+    // Anotación del encargo (tipo de cita o motivo de cierre)
+    await addAnotacionEncargo(page, task.anotacion);
+    // Subir PDF de transcripción
     await uploadPdfToEncargo(page, task.encargo);
+    // Desasignar perito virtual — dejar el encargo sin asignación
     if (doPerito) {
       await openByEncargo(page, task.encargo);
       await desasignarPerito(page, VIRTUAL_PERITO_NAME);
