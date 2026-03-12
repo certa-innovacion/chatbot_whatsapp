@@ -82,6 +82,14 @@ function v(row, ...keys) {
   return val || '-';
 }
 
+function norm(value) {
+  return String(value || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .trim();
+}
+
 function buildObservacionesEspecialesText(row) {
   const digital = v(row, 'Digital');
   const horario = v(row, 'Horario');
@@ -94,7 +102,40 @@ function buildObservacionesEspecialesText(row) {
   const attPeritoRaw  = String(row['AT. Perito'] ?? row['ATT. Perito'] ?? row['Att. Perito'] ?? '').trim();
   const attParts      = attPeritoRaw ? attPeritoRaw.split(' - ') : [];
   const attNombre   = attParts[0] && attParts[0] !== 'sin indicar' ? attParts[0] : '-';
+  const attRelacion = attParts[1] && attParts[1] !== 'sin indicar' ? attParts[1] : '';
   const attTelefono = attParts[2] && attParts[2] !== 'sin indicar' ? attParts[2] : '';
+  const aseguradoNombre = v(row, 'Asegurado', 'Nombre');
+  const relacionActual = v(row, 'Relación', 'Relacion');
+
+  const attNombreNorm = norm(attNombre);
+  const attRelacionNorm = norm(attRelacion);
+  const aseguradoNombreNorm = norm(aseguradoNombre);
+  const relacionActualNorm = norm(relacionActual);
+  const attSelfTokens = new Set([
+    'yo',
+    'soy yo',
+    'el mismo',
+    'la misma',
+    'mismo',
+    'misma',
+    'el titular',
+    'la titular',
+    'titular',
+    'asegurado',
+    'asegurada',
+    'el asegurado',
+    'la asegurada',
+  ]);
+  const attIsSelf = attSelfTokens.has(attNombreNorm);
+  const attMatchesAsegurado = Boolean(attNombreNorm && aseguradoNombreNorm && attNombreNorm === aseguradoNombreNorm);
+  const attRelacionIsAsegurado = attRelacionNorm.includes('asegurad');
+  const relacionIsAsegurado = relacionActualNorm.includes('asegurad');
+  const atiendeAsegurado = attIsSelf || attMatchesAsegurado || attRelacionIsAsegurado || (relacionIsAsegurado && attNombreNorm === '-');
+
+  const relacionLine = atiendeAsegurado ? '• Relación: Asegurado' : `• Relación: ${relacionActual}`;
+  const atPeritoLine = atiendeAsegurado
+    ? `• AT. Perito: ${aseguradoNombre !== '-' ? aseguradoNombre : attNombre}`
+    : `• AT. Perito: ${attNombre}`;
 
   // Teléfono: preferir el del asistente al perito; si no, el del asegurado
   const telefonoContacto = attTelefono || v(row, 'Teléfono');
@@ -107,10 +148,10 @@ function buildObservacionesEspecialesText(row) {
     `• CP: ${v(row, 'CP')}`,
     `• Municipio: ${v(row, 'Municipio')}`,
     `• Teléfono: ${telefonoContacto}`,
-    `• Relación: ${v(row, 'Relación', 'Relacion')}`,
+    relacionLine,
     `• Daños: ${v(row, 'Daños')}`,
     digitalLine,
-    `• AT. Perito: ${attNombre}`,
+    atPeritoLine,
   ];
   return lines.join('\n');
 }
@@ -1113,4 +1154,9 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main };
+module.exports = {
+  main,
+  _test: {
+    buildObservacionesEspecialesText,
+  },
+};
