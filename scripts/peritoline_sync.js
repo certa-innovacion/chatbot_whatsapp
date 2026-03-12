@@ -287,39 +287,29 @@ async function fillEditorElement(el, text) {
 }
 
 async function addObservacionesEspeciales(page, text) {
+  // Hacer scroll hasta la sección y pulsar siempre Añadir o Editar (no usar pre-check
+  // de saveLocators porque da falsos positivos con otros botones Guardar de la página).
+  const sectionTitle = page.getByText(/OBSERVACIONES ESPECIALES DEL SINIESTRO/i).first();
+  if (await sectionTitle.count()) await sectionTitle.scrollIntoViewIfNeeded().catch(() => {});
+
+  const addEditLocators = [
+    page.locator('xpath=//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "observaciones especiales del siniestro")]/following::*[self::a or self::button][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "anadir") or contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "añadir") or contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "editar")][1]'),
+    page.getByRole('button', { name: /editar/i }),
+    page.getByRole('button', { name: /a[nñ]adir/i }),
+    page.locator('a:has-text("Editar"), button:has-text("Editar")'),
+    page.locator('a:has-text("Añadir"), button:has-text("Añadir"), a:has-text("Anadir"), button:has-text("Anadir")'),
+  ];
+
+  const btnReady = await waitAnyVisible(addEditLocators, 8000);
+  if (!btnReady) throw new Error('No se encontró botón "Editar/Añadir" en Observaciones especiales del siniestro');
+  const btnClicked = await clickFirstExisting(addEditLocators);
+  if (!btnClicked) throw new Error('No se pudo pulsar "Editar/Añadir" en Observaciones especiales del siniestro');
+
+  // Esperar que aparezca el botón Guardar (indica que el editor está abierto).
   const saveLocators = [
     page.locator('button:has-text("Guardar"), a:has-text("Guardar"), input[type="submit"][value*="Guardar" i]'),
     page.getByRole('button', { name: /guardar/i }),
   ];
-  const addLocators = [
-    page.locator('xpath=//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "observaciones especiales del siniestro")]/following::*[self::a or self::button][contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "anadir") or contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "añadir") or contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZÁÉÍÓÚÑ", "abcdefghijklmnopqrstuvwxyzáéíóúñ"), "editar")][1]'),
-    page.locator('a:has-text("Añadir"), button:has-text("Añadir"), a:has-text("Anadir"), button:has-text("Anadir")'),
-    page.locator('a:has-text("Editar"), button:has-text("Editar")'),
-    page.getByText(/^\+?\s*a[nñ]adir$/i),
-    page.getByRole('button', { name: /a[nñ]adir/i }),
-    page.getByRole('button', { name: /editar/i }),
-  ];
-
-  // Si el editor ya estaba abierto, no hace falta pulsar "Añadir".
-  let editorOpen = await waitAnyVisible(saveLocators, 1200);
-  if (!editorOpen) {
-    const title = page.getByText(/OBSERVACIONES ESPECIALES DEL SINIESTRO/i).first();
-    if (await title.count()) await title.scrollIntoViewIfNeeded().catch(() => {});
-
-    const addReady = await waitAnyVisible(addLocators, 8000);
-    if (addReady) {
-      const addClicked = await clickFirstExisting(addLocators);
-      if (!addClicked) {
-        editorOpen = await waitAnyVisible(saveLocators, 1500);
-        if (!editorOpen) throw new Error('No se pudo pulsar "Añadir" en Observaciones especiales');
-      }
-    } else {
-      editorOpen = await waitAnyVisible(saveLocators, 1500);
-        if (!editorOpen) throw new Error('No se encontró botón "Añadir" en Observaciones especiales');
-    }
-  }
-
-  // Esperar controles de edición (Guardar/Cancelar) del editor.
   const saveReady = await waitAnyVisible(saveLocators, TIMEOUT_MS);
   if (!saveReady) throw new Error('No aparecieron los controles de edición de Observaciones especiales');
 
@@ -363,10 +353,9 @@ async function addObservacionesEspeciales(page, text) {
 
   if (!written) throw new Error('No se pudo localizar el editor de Observaciones especiales');
 
-  const saved = await clickFirstExisting([
-    ...saveLocators,
-  ]);
+  const saved = await clickFirstExisting(saveLocators);
   if (!saved) throw new Error('No se encontró botón "Guardar" en Observaciones especiales');
+  console.log('📝 Observaciones especiales escritas/actualizadas');
 }
 
 async function isContactoAlreadyMarked(page) {
@@ -602,23 +591,28 @@ async function addAnotacionEncargo(page, text) {
   const truncated = text.slice(0, 128);
 
   const candidates = [
-    page.locator('textarea[maxlength="128"]').first(),
-    page.locator('xpath=//*[contains(translate(normalize-space(.), "ANOTACI\u00d3N", "anotaci\u00f3n"), "anotaci") and contains(translate(normalize-space(.), "ENCARGO", "encargo"), "encargo")]/following::textarea[1]'),
-    page.locator('textarea[name*="anotacion" i], textarea[id*="anotacion" i]'),
+    page.locator('xpath=//*[contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c1\u00c9\u00cd\u00d3\u00da\u00d1", "abcdefghijklmnopqrstuvwxyz\u00e1\u00e9\u00ed\u00f3\u00fa\u00f1"), "anotaci") and contains(translate(normalize-space(.), "ABCDEFGHIJKLMNOPQRSTUVWXYZ\u00c1\u00c9\u00cd\u00d3\u00da\u00d1", "abcdefghijklmnopqrstuvwxyz\u00e1\u00e9\u00ed\u00f3\u00fa\u00f1"), "encargo")]/following::*[(self::input or self::textarea) and not(@type="hidden")][1]'),
+    page.locator('input[name*="anotacion" i], input[id*="anotacion" i], textarea[name*="anotacion" i], textarea[id*="anotacion" i]'),
   ];
 
   for (const candidate of candidates) {
     if (!(await candidate.count())) continue;
     const el = candidate.first();
     if (!(await el.isVisible().catch(() => false))) continue;
+
+    const isObservacionesSiniestro = await el.evaluate((node) => {
+      const container = node.closest('tr, td, .row, .form-group, .control-group, div') || node.parentElement;
+      const textAround = String(container?.innerText || '').toLowerCase();
+      return textAround.includes('observaciones del siniestro') && !textAround.includes('anotaci');
+    }).catch(() => false);
+    if (isObservacionesSiniestro) continue;
+
     await el.scrollIntoViewIfNeeded().catch(() => {});
     await el.click({ force: true });
-    await el.fill(truncated);
-    await el.evaluate(node => {
-      node.dispatchEvent(new Event('input', { bubbles: true }));
-      node.dispatchEvent(new Event('change', { bubbles: true }));
-      node.dispatchEvent(new Event('blur',   { bubbles: true }));
-    });
+    await fillEditorElement(el, truncated);
+    await el.evaluate((node) => {
+      node.dispatchEvent(new Event('blur', { bubbles: true }));
+    }).catch(() => {});
     await page.waitForTimeout(300);
     console.log(`📝 Anotación encargo escrita: "${truncated}"`);
     return;
@@ -694,11 +688,12 @@ async function processTask(page, task) {
     console.warn(`⚠️  Modal contacto omitido (probablemente ya marcado): ${err.message}`);
   }
 
-  // 4-6. Solo al cierre de conversación (datos ya completos)
+  // 4. Observaciones especiales: siempre actualizar con el estado más reciente del Excel.
+  await openByEncargo(page, task.encargo);
+  await addObservacionesEspeciales(page, task.observacionesEspeciales);
+
+  // 5-7. Solo al cierre de conversación (datos ya completos)
   if (task.finalSync) {
-    // Observaciones especiales con los datos recogidos en la conversación completa
-    await openByEncargo(page, task.encargo);
-    await addObservacionesEspeciales(page, task.observacionesEspeciales);
     // PeritoLine puede redirigir al dashboard al guardar — reabrimos el encargo
     await openByEncargo(page, task.encargo);
     // Anotación del encargo (tipo de cita o motivo de cierre)
