@@ -84,7 +84,10 @@ function isDefinitiveClosingMessage(text) {
     t.includes('trasladamos la información al perito') ||
     t.includes('trasladamos la informacion al perito') ||
     t.includes('le contactará el perito') ||
-    t.includes('le contactara el perito')
+    t.includes('le contactara el perito') ||
+    t.includes('para coordinar la visita') ||
+    t.includes('para coordinar la inspeccion') ||
+    t.includes('para coordinar la inspección')
   );
 }
 
@@ -431,11 +434,11 @@ async function processMessage(waId, messageObj) {
         let horarioLabel = '';
         if (horarioVal.includes('mañana') || horarioVal.includes('manana')) horarioLabel = 'Mañana';
         else if (horarioVal.includes('tarde')) horarioLabel = 'Tarde';
-        let anotacion = '';
+        let anotacion = '[IA] Digital: sin determinar';
         if (digitalVal === 'Sí') {
           anotacion = horarioLabel ? `[IA] Digital: Sí (${horarioLabel})` : '[IA] Digital: Sí';
         }
-        else if (digitalVal === 'No') anotacion = '[IA] Digital: No';
+        else if (digitalVal === 'No') anotacion = '[IA] Digital: Rechaza';
         triggerEncargoSync(nexp, `stage_${stageAplicado}`, anotacion, false, true);
       }
 

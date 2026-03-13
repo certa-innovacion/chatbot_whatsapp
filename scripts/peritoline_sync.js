@@ -1085,6 +1085,8 @@ async function main() {
       await login(page);
       await openByEncargo(page, CLI.encargo);
       await asignarPerito(page, VIRTUAL_PERITO_NAME);
+      await openByEncargo(page, CLI.encargo);
+      await addAnotacionEncargo(page, '[IA] En proceso');
       console.log(`✅ Perito asignado en encargo ${CLI.encargo}`);
     } finally {
       await context.close();

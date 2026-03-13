@@ -171,7 +171,7 @@ async function sendInitialMessages(opts = {}) {
         stage:              'consent',
         attempts:           0,
         inactivityAttempts: 0,
-        mensajes:           [],
+        mensajes:           [{ direction: 'out', text: buildInitialTemplateText({ aseguradora, nexp, causa: causaTemplate }), timestamp: new Date().toISOString() }],
         contacto:           'En curso',
         lastMessageAt:      Date.now(),
         lastUserMessageAt:  null,   // resetear para que el scheduler detecte scenario A
@@ -192,9 +192,6 @@ async function sendInitialMessages(opts = {}) {
     } else {
       try {
         await sendInitialTemplate(waId, 'inicio', { aseguradora, nexp, causa: causaTemplate });
-        conversationManager.createOrUpdateConversation(waId, {
-          mensajes: [{ direction: 'out', text: buildInitialTemplateText({ aseguradora, nexp, causa: causaTemplate }), timestamp: new Date().toISOString() }],
-        });
         console.log(`✅ Plantilla enviada correctamente`);
         resultados.ok++;
         await sleep(SEND_DELAY_MS);
