@@ -314,12 +314,24 @@ async function callOpenAI({ validHistory, promptFinal, contextoExtra, mensajeUsu
     ? `\n\nREGLA ABSOLUTA DE IDIOMA: El usuario ha escrito en ${langHint.name}. Debes responder OBLIGATORIAMENTE en ${langHint.name} en "mensaje_para_usuario". Pon "${langHint.code}" en "idioma_conversacion". No uses ningún otro idioma bajo ninguna circunstancia.`
     : `\n\nREGLA DE IDIOMA: Detecta el idioma del último mensaje del usuario y responde SIEMPRE en ese mismo idioma en "mensaje_para_usuario". Rellena "idioma_conversacion" con su código ISO 639-1.`;
 
+  const mandatoryFieldsRule = `
+
+CAMPOS OBLIGATORIOS — NUNCA omitas estos pasos en el flujo:
+
+1. QUIÉN ATENDERÁ AL PERITO: Antes de ofrecer videoperitación, confirma SIEMPRE quién atenderá al perito en la intervención. Si es la misma persona que responde, no pidas más datos. Si es otra persona, solicita nombre, teléfono y relación con el asegurado, y rellena los campos "nombre_contacto", "relacion_contacto" y "telefono_contacto".
+
+2. ESTIMACIÓN ECONÓMICA (campo "importe_estimado"): Solicita SIEMPRE la estimación de daños antes de evaluar si procede videoperitación. Pregunta directamente por el importe aproximado. Si el asegurado no sabe o tiene dudas, muestra la horquilla con lista de puntos:
+• 0 – 5.000 €
+• 5.001 – 10.000 €
+• Más de 10.000 €
+Una vez obtenida, rellena "importe_estimado" con el valor indicado. No avances a la evaluación de videoperitación sin este dato.`;
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const messages = [
-      { role: 'system', content: promptFinal + languageRule },
+      { role: 'system', content: promptFinal + languageRule + mandatoryFieldsRule },
       ...validHistory.map(item => ({
         role: item.role === 'model' ? 'assistant' : item.role,
         content: item.parts?.map(p => p.text).filter(Boolean).join('\n') || '',
