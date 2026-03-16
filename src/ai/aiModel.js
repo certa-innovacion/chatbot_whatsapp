@@ -507,8 +507,73 @@ async function procesarConIA(historial, mensajeUsuario, contextoExtra, valoresEx
   }
 }
 
+/**
+ * Traduce todos los mensajes de una conversación al español usando IA.
+ * Devuelve un nuevo array con los mismos mensajes pero con el texto traducido.
+ *
+ * @param {Array}  mensajes - Array de { direction, text, timestamp }
+ * @param {string} idioma   - Código ISO 639-1 del idioma origen (ej: 'ja', 'ca')
+ * @returns {Promise<Array>}
+ */
+async function translateMessagesToSpanish(mensajes, idioma) {
+  if (!mensajes?.length) return mensajes;
+
+  // Serializar mensajes como lista numerada para traducción en bloque
+  const serialized = mensajes
+    .map((m, i) => `[${i}] ${m.text}`)
+    .join('\n---\n');
+
+  const systemPrompt =
+    `Eres un traductor profesional. Traduce al español cada uno de los mensajes numerados que siguen. ` +
+    `El idioma original es "${idioma}". ` +
+    `Responde EXCLUSIVAMENTE con un JSON: {"t": ["traducción del mensaje 0", "traducción del mensaje 1", ...]}. ` +
+    `No traduzcas nombres propios, números de expediente ni URLs. Si un fragmento ya está en español, mantenlo idéntico.`;
+
+  let rawJson;
+
+  if (process.env.OPENAI_API_KEY) {
+    const res = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: process.env.OPENAI_MODEL || 'gpt-4.1-mini',
+        temperature: 0,
+        response_format: { type: 'json_object' },
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user',   content: serialized },
+        ],
+      }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(body?.error?.message || `OpenAI HTTP ${res.status}`);
+    rawJson = body.choices?.[0]?.message?.content;
+  } else {
+    await initIA();
+    const model = client.getGenerativeModel({
+      model: currentModel(),
+      systemInstruction: systemPrompt,
+      generationConfig: { responseMimeType: 'application/json', temperature: 0 },
+    });
+    const result = await model.generateContent(serialized);
+    rawJson = result.response.text();
+  }
+
+  const data = JSON.parse(rawJson || '{}');
+  const translations = Array.isArray(data.t) ? data.t : [];
+
+  return mensajes.map((m, i) => ({
+    ...m,
+    text: translations[i] ?? m.text,
+  }));
+}
+
 module.exports = {
   procesarConIA,
+  translateMessagesToSpanish,
   _test: {
     isJsonParseError,
     parseModelJsonResponse,

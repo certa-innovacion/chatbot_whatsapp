@@ -40,7 +40,7 @@ function generateConversationPdf(nexp, userData = {}, mensajes = [], extra = {})
     fs.mkdirSync(OUTPUT_DIR, { recursive: true });
   }
 
-  const filename = `conversation_${nexp}.pdf`;
+  const filename = extra.filename || `conversation_${nexp}.pdf`;
   const filepath = path.join(OUTPUT_DIR, filename);
 
   const doc = new PDFDocument({ margin: 40, size: 'A4' });
@@ -54,10 +54,20 @@ function generateConversationPdf(nexp, userData = {}, mensajes = [], extra = {})
   doc.fillColor('white')
     .font('Helvetica-Bold').fontSize(14)
     .text('Gabinete Pericial Jumar — Registro de Conversación', 50, 53, { width: PAGE_W - 20 });
-  doc.moveDown(0.2);
 
+  // Banner de traducción (solo en PDFs traducidos)
+  if (extra.translatedFrom) {
+    doc.y = 95;
+    doc.rect(40, doc.y, PAGE_W, 18).fill('#fff3cd');
+    doc.fillColor('#856404').font('Helvetica-Bold').fontSize(8)
+      .text(
+        `Traducción automática al español — idioma original: ${extra.translatedFrom.toUpperCase()}`,
+        48, doc.y + 4, { width: PAGE_W - 16 }
+      );
+    doc.y = 118;
+  }
   // ── Ficha del expediente ──────────────────────────────────────────────────
-  doc.y = 110;
+  doc.y = extra.translatedFrom ? doc.y + 6 : 110;
   doc.fillColor(COLOR_TEXT).font('Helvetica-Bold').fontSize(10)
     .text(`Expediente: `, { continued: true })
     .font('Helvetica').text(String(nexp || '—'));

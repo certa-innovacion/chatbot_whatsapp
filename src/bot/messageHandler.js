@@ -1,6 +1,6 @@
 // src/bot/messageHandler.js
 const conversationManager = require('./conversationManager');
-const { procesarConIA }   = require('../ai/aiModel');
+const { procesarConIA, translateMessagesToSpanish } = require('../ai/aiModel');
 const adapter             = require('../channels/whatsappAdapter');
 const { canProcess }      = require('./stateMachine');
 const { triggerEncargoSync } = require('./peritolineAutoSync');
@@ -451,14 +451,29 @@ async function processMessage(waId, messageObj) {
       // Generar PDF de transcripción al finalizar la conversación
       if (stageAplicado === 'finalizado' || stageAplicado === 'escalated') {
         const allMsgs = excelUpdates.mensajes || conversationManager.getMensajes(waId);
-        generateConversationPdf(nexp, userData, allMsgs, {
+        const pdfExtra = {
           stage:     stageAplicado,
           contacto:  excelUpdates.contacto,
           attPerito: conversation.attPerito,
           danos:     conversation.danos     || excelUpdates.danos,
           digital:   conversation.digital   || excelUpdates.digital,
           horario:   conversation.horario   || excelUpdates.horario,
-        }).catch(e => console.error(`❌ Error generando PDF nexp=${nexp}:`, e.message));
+        };
+
+        generateConversationPdf(nexp, userData, allMsgs, pdfExtra)
+          .catch(e => console.error(`❌ Error generando PDF nexp=${nexp}:`, e.message));
+
+        // PDF traducido al español si la conversación fue en otro idioma
+        const idioma = excelUpdates.idioma || conversation.idioma;
+        if (idioma && idioma !== 'es') {
+          translateMessagesToSpanish(allMsgs, idioma)
+            .then(translated => generateConversationPdf(nexp, userData, translated, {
+              ...pdfExtra,
+              filename: `conversation_${nexp}_español.pdf`,
+              translatedFrom: idioma,
+            }))
+            .catch(e => console.error(`❌ Error generando PDF traducido nexp=${nexp}:`, e.message));
+        }
       }
     }
 
