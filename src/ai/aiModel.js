@@ -312,9 +312,11 @@ async function callOpenAI({ validHistory, promptFinal, contextoExtra, mensajeUsu
         role: 'user',
         content: `${buildUserMessage(contextoExtra, mensajeUsuario)}
 
+IMPORTANTE — IDIOMA: Detecta el idioma del último mensaje del usuario y responde SIEMPRE en ese mismo idioma en el campo "mensaje_para_usuario". Nunca respondas en español si el usuario ha escrito en otro idioma. Rellena "idioma_conversacion" con el código ISO 639-1 del idioma detectado (ej: "ja", "en", "ca", "eu", "fr").
+
 Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:
 {
-  "mensaje_para_usuario": "string",
+  "mensaje_para_usuario": "string (en el idioma del usuario)",
   "mensaje_entendido": true,
   "datos_extraidos": {
     "asegurado_confirmado": true,
@@ -325,7 +327,7 @@ Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:
     "acepta_videollamada": false,
     "preferencia_horaria": "",
     "estado_expediente": "identificacion|valoracion|agendando|finalizado|escalado_humano",
-    "idioma_conversacion": "es"
+    "idioma_conversacion": "<código ISO 639-1 del idioma del usuario>"
   }
 }`,
       },
