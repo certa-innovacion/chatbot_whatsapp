@@ -285,6 +285,17 @@ async function callGemini({ validHistory, promptFinal, contextoExtra, mensajeUsu
   };
 }
 
+function detectLanguageHint(text) {
+  if (/[\u3040-\u309F\u30A0-\u30FF\u4E00-\u9FAF]/.test(text)) return { code: 'ja', name: 'japonés' };
+  if (/[\uAC00-\uD7AF]/.test(text)) return { code: 'ko', name: 'coreano' };
+  if (/[\u4E00-\u9FFF]/.test(text)) return { code: 'zh', name: 'chino' };
+  if (/[\u0400-\u04FF]/.test(text)) return { code: 'ru', name: 'ruso' };
+  if (/[\u0600-\u06FF]/.test(text)) return { code: 'ar', name: 'árabe' };
+  if (/[\u0900-\u097F]/.test(text)) return { code: 'hi', name: 'hindi' };
+  if (/[\u0370-\u03FF]/.test(text)) return { code: 'el', name: 'griego' };
+  return null;
+}
+
 async function callOpenAI({ validHistory, promptFinal, contextoExtra, mensajeUsuario }) {
   if (String(process.env.OPENAI_FALLBACK_ENABLED || 'true').toLowerCase() === 'false') {
     throw new Error('Fallback OpenAI desactivado');
@@ -298,12 +309,17 @@ async function callOpenAI({ validHistory, promptFinal, contextoExtra, mensajeUsu
   const model = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
   const timeoutMs = Number(process.env.OPENAI_TIMEOUT_MS || 15000);
 
+  const langHint = detectLanguageHint(mensajeUsuario);
+  const languageRule = langHint
+    ? `\n\nREGLA ABSOLUTA DE IDIOMA: El usuario ha escrito en ${langHint.name}. Debes responder OBLIGATORIAMENTE en ${langHint.name} en "mensaje_para_usuario". Pon "${langHint.code}" en "idioma_conversacion". No uses ningún otro idioma bajo ninguna circunstancia.`
+    : `\n\nREGLA DE IDIOMA: Detecta el idioma del último mensaje del usuario y responde SIEMPRE en ese mismo idioma en "mensaje_para_usuario". Rellena "idioma_conversacion" con su código ISO 639-1.`;
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const messages = [
-      { role: 'system', content: promptFinal },
+      { role: 'system', content: promptFinal + languageRule },
       ...validHistory.map(item => ({
         role: item.role === 'model' ? 'assistant' : item.role,
         content: item.parts?.map(p => p.text).filter(Boolean).join('\n') || '',
@@ -311,8 +327,6 @@ async function callOpenAI({ validHistory, promptFinal, contextoExtra, mensajeUsu
       {
         role: 'user',
         content: `${buildUserMessage(contextoExtra, mensajeUsuario)}
-
-IMPORTANTE — IDIOMA: Detecta el idioma del último mensaje del usuario y responde SIEMPRE en ese mismo idioma en el campo "mensaje_para_usuario". Nunca respondas en español si el usuario ha escrito en otro idioma. Rellena "idioma_conversacion" con el código ISO 639-1 del idioma detectado (ej: "ja", "en", "ca", "eu", "fr").
 
 Devuelve EXCLUSIVAMENTE un JSON válido con esta estructura:
 {
