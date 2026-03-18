@@ -283,9 +283,16 @@ El scheduler corre cada `SCHEDULER_CHECK_MINUTES` (15 min). Los mensajes de inac
 
 ## Almacenamiento de datos
 
-Todo el estado del bot vive en el **mismo archivo Excel** (`data/allianz_latest.xlsx`), en dos capas:
+El estado del bot se divide en **dos archivos independientes** para que reemplazar el Excel de negocio nunca afecte las conversaciones activas:
 
-### Capa 1 — Datos de negocio (hoja principal)
+| Archivo | Propósito | Quién lo gestiona |
+|---|---|---|
+| `data/allianz_latest.xlsx` | Datos de negocio — expedientes, teléfonos, resultados | Equipo Jumar (se puede reemplazar libremente) |
+| `data/bot_state.xlsx` | Estado técnico de conversaciones activas | Solo el bot (no tocar manualmente) |
+
+> **Importante:** `data/bot_state.xlsx` se crea automáticamente al primer mensaje. Al arrancar, si el Excel de negocio contiene una hoja `__bot_state` (instalación anterior), se migra automáticamente a `bot_state.xlsx` y se elimina del Excel de negocio.
+
+### `data/allianz_latest.xlsx` — Datos de negocio (hoja principal)
 
 Gestionada por el equipo de Jumar. El bot lee estos campos y escribe el resultado de la conversación:
 
@@ -305,9 +312,9 @@ Gestionada por el equipo de Jumar. El bot lee estos campos y escribe el resultad
 | `Digital` | **Escritura** | Acepta videoperitación (`Sí` / `No`) |
 | `Horario` | **Escritura** | Preferencia horaria (`Mañana` / `Tarde`) |
 
-### Capa 2 — Estado técnico (hoja `__bot_state`)
+### `data/bot_state.xlsx` — Estado técnico (hoja `__bot_state`)
 
-Gestionada exclusivamente por el bot. Persiste el estado entre reinicios:
+Gestionada exclusivamente por el bot. Persiste el estado entre reinicios. **No sustituir ni editar este archivo manualmente** salvo para recuperación de emergencia:
 
 | Campo | Descripción |
 |---|---|

@@ -6,6 +6,7 @@ const fs   = require('fs');
 const os   = require('os');
 
 const EXCEL_PATH           = process.env.EXCEL_PATH || path.join(__dirname, '..', '..', 'data', 'allianz_latest.xlsx');
+const STATE_FILE_PATH      = process.env.CONV_STATE_FILE  || path.join(path.dirname(EXCEL_PATH), 'bot_state.xlsx');
 const BUSINESS_HOURS_START = Number(process.env.BUSINESS_HOURS_START  || 9);
 const BUSINESS_HOURS_END   = Number(process.env.BUSINESS_HOURS_END    || 20);
 const CLEANUP_DAYS         = Number(process.env.SINIESTRO_CLEANUP_DAYS || 7);
@@ -103,6 +104,89 @@ function saveWorkbook(wb) {
   } else {
     fs.writeFileSync(EXCEL_PATH, fs.readFileSync(tmp));
     fs.unlinkSync(tmp);
+  }
+}
+
+// ── Estado técnico en archivo separado ───────────────────────────────────────
+
+function readStateWorkbook() {
+  if (!fs.existsSync(STATE_FILE_PATH)) {
+    const wb = XLSX.utils.book_new();
+    const ws = XLSX.utils.aoa_to_sheet([Object.values(STATE_FIELDS)]);
+    XLSX.utils.book_append_sheet(wb, ws, STATE_SHEET_NAME);
+    return wb;
+  }
+  return XLSX.readFile(STATE_FILE_PATH);
+}
+
+function saveStateWorkbook(wb) {
+  const tmp = `${STATE_FILE_PATH}.${process.pid}.tmp`;
+  XLSX.writeFile(wb, tmp, { bookType: 'xlsx' });
+  if (os.platform() !== 'win32') {
+    fs.renameSync(tmp, STATE_FILE_PATH);
+  } else {
+    fs.writeFileSync(STATE_FILE_PATH, fs.readFileSync(tmp));
+    fs.unlinkSync(tmp);
+  }
+}
+
+/**
+ * Si el Excel de negocio aún contiene la hoja __bot_state (instalación antigua),
+ * la migra al archivo separado y la elimina del Excel de negocio.
+ */
+function migrateStateSheetToFile() {
+  try {
+    if (!fs.existsSync(EXCEL_PATH)) return;
+    const wb = XLSX.readFile(EXCEL_PATH);
+    if (!wb.Sheets[STATE_SHEET_NAME]) return;
+
+    const stateWb = readStateWorkbook();
+    const srcWs   = wb.Sheets[STATE_SHEET_NAME];
+    const srcHeaders = getRawHeaders(srcWs);
+    const srcRange   = XLSX.utils.decode_range(srcWs['!ref']);
+
+    const dstWs      = getOrCreateStateSheet(stateWb);
+    let   dstHeaders = getStateHeaders(dstWs);
+    dstHeaders       = ensureStateColumns(dstWs, dstHeaders);
+
+    let migrated = 0;
+    for (let r = srcRange.s.r + 1; r <= srcRange.e.r; r++) {
+      const waId = getCellStr(srcWs, r, srcHeaders[STATE_FIELDS.waId]).trim();
+      if (!waId) continue;
+      // Solo migrar si no existe ya en el archivo de estado
+      if (findStateRowByWaId(dstWs, dstHeaders, waId) !== -1) continue;
+
+      const srcState = rowToState(srcWs, srcHeaders, r);
+      if (!srcState) continue;
+
+      const dstRow = appendSheetRow(dstWs);
+      const next = { ...srcState, waId };
+      next.status = next.stage === 'escalated' ? 'escalated' : 'pending';
+
+      setCellValue(dstWs, dstRow, dstHeaders[STATE_FIELDS.waId],   next.waId);
+      setCellValue(dstWs, dstRow, dstHeaders[STATE_FIELDS.status],  String(next.status  || 'pending'));
+      setCellValue(dstWs, dstRow, dstHeaders[STATE_FIELDS.stage],   String(next.stage   || 'consent'));
+      for (const f of [STATE_FIELDS.attempts, STATE_FIELDS.inactivityAttempts,
+        STATE_FIELDS.nextReminderAt, STATE_FIELDS.lastUserMessageAt,
+        STATE_FIELDS.lastReminderAt, STATE_FIELDS.lastMessageAt]) {
+        const v = next[f];
+        if (v === null || v === undefined || v === '') setCellValue(dstWs, dstRow, dstHeaders[f], '');
+        else setCellNumber(dstWs, dstRow, dstHeaders[f], Number(v));
+      }
+      setCellValue(dstWs, dstRow, dstHeaders[STATE_FIELDS.mensajes], JSON.stringify(Array.isArray(next.mensajes) ? next.mensajes : []));
+      migrated++;
+    }
+
+    if (migrated > 0) saveStateWorkbook(stateWb);
+
+    // Eliminar la hoja del Excel de negocio
+    delete wb.Sheets[STATE_SHEET_NAME];
+    wb.SheetNames = wb.SheetNames.filter(n => n !== STATE_SHEET_NAME);
+    saveWorkbook(wb);
+
+    console.log(`🔀 Migración __bot_state → bot_state.xlsx completada (${migrated} conversaciones migradas)`);
+  } catch (err) {
+    console.error('❌ Error migrando __bot_state a archivo separado:', err.message);
   }
 }
 
@@ -225,7 +309,7 @@ function getOrCreateStateSheet(wb) {
   if (!wb.Sheets[STATE_SHEET_NAME]) {
     const ws = XLSX.utils.aoa_to_sheet([Object.values(STATE_FIELDS)]);
     wb.Sheets[STATE_SHEET_NAME] = ws;
-    wb.SheetNames.push(STATE_SHEET_NAME);
+    if (!wb.SheetNames.includes(STATE_SHEET_NAME)) wb.SheetNames.push(STATE_SHEET_NAME);
   }
   return wb.Sheets[STATE_SHEET_NAME];
 }
@@ -416,7 +500,7 @@ function updateConversationExcel(waId, fields) {
 
 function readStateByWaId(waId) {
   try {
-    const wb = readWorkbook();
+    const wb = readStateWorkbook();
     const ws = wb.Sheets[STATE_SHEET_NAME];
     if (!ws) return null;
     const headers = getStateHeaders(ws);
@@ -431,7 +515,7 @@ function readStateByWaId(waId) {
 
 function readAllStatesFromExcel() {
   try {
-    const wb = readWorkbook();
+    const wb = readStateWorkbook();
     const ws = wb.Sheets[STATE_SHEET_NAME];
     if (!ws) return [];
     const headers = getStateHeaders(ws);
@@ -450,7 +534,7 @@ function readAllStatesFromExcel() {
 
 function upsertStateInExcel(waId, patch = {}) {
   try {
-    const wb = readWorkbook();
+    const wb = readStateWorkbook();
     const ws = getOrCreateStateSheet(wb);
     let headers = getStateHeaders(ws);
     headers = ensureStateColumns(ws, headers);
@@ -489,7 +573,7 @@ function upsertStateInExcel(waId, patch = {}) {
     const mensajes = Array.isArray(next.mensajes) ? next.mensajes : [];
     setCellValue(ws, row, headers[STATE_FIELDS.mensajes], JSON.stringify(mensajes));
 
-    saveWorkbook(wb);
+    saveStateWorkbook(wb);
     return next;
   } catch (err) {
     console.error('❌ Error actualizando estado técnico en Excel:', err.message);
@@ -685,10 +769,9 @@ function cleanOldRows() {
 function applyPatches(waId, techPatch = {}, excelPatch = {}) {
   acquireLock();
   try {
-    const wb = readWorkbook();
-
-    // ── Patch hoja __bot_state ────────────────────────────────────────────────
-    const stateWs      = getOrCreateStateSheet(wb);
+    // ── Patch archivo de estado (bot_state.xlsx) ──────────────────────────────
+    const stateWb      = readStateWorkbook();
+    const stateWs      = getOrCreateStateSheet(stateWb);
     let   stateHeaders = getStateHeaders(stateWs);
     stateHeaders       = ensureStateColumns(stateWs, stateHeaders);
 
@@ -721,8 +804,11 @@ function applyPatches(waId, techPatch = {}, excelPatch = {}) {
     const mensajes = Array.isArray(next.mensajes) ? next.mensajes : [];
     setCellValue(stateWs, stateRow, stateHeaders[STATE_FIELDS.mensajes], JSON.stringify(mensajes));
 
-    // ── Patch hoja principal ──────────────────────────────────────────────────
+    saveStateWorkbook(stateWb);
+
+    // ── Patch hoja principal del Excel de negocio ─────────────────────────────
     if (Object.keys(excelPatch).length) {
+      const wb          = readWorkbook();
       const mainWs      = wb.Sheets[wb.SheetNames[0]];
       let   mainHeaders = getHeaders(mainWs);
       mainHeaders       = ensureAllColumns(mainWs, mainHeaders);
@@ -740,10 +826,9 @@ function applyPatches(waId, techPatch = {}, excelPatch = {}) {
           else if (typeof value === 'number') setCellNumber(mainWs, mainRow, c, value);
           else                               setCellValue(mainWs, mainRow, c, String(value));
         }
+        saveWorkbook(wb);
       }
     }
-
-    saveWorkbook(wb);
   } finally {
     releaseLock();
   }
@@ -755,6 +840,7 @@ module.exports = {
   cleanOldRows,
   extractTechnicalStateFromExcel,
   removeTechnicalColumns,
+  migrateStateSheetToFile,
   readStateByWaId,
   readAllStatesFromExcel,
   upsertStateInExcel,

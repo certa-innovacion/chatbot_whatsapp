@@ -6,6 +6,7 @@ const {
   readConversationByWaId,
   extractTechnicalStateFromExcel,
   removeTechnicalColumns,
+  migrateStateSheetToFile,
   readStateByWaId,
   readAllStatesFromExcel,
   upsertStateInExcel,
@@ -54,6 +55,9 @@ function migrateLegacyTechnicalState() {
 }
 
 migrateLegacyTechnicalState();
+// Si el Excel de negocio aún contiene __bot_state (instalación anterior),
+// lo migra al archivo independiente bot_state.xlsx y lo elimina del Excel.
+migrateStateSheetToFile();
 
 function mergeConversation(baseExcel, state) {
   if (!baseExcel) return null;
