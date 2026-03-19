@@ -209,8 +209,18 @@ async function handleInactivity(conv, now) {
 async function finalizar(waId, nexp, anotacion = '') {
   try {
     const conv = conversationManager.getConversation(waId);
-    const mensajes = conversationManager.getMensajes(waId);
+    let mensajes = conversationManager.getMensajes(waId);
     const userData = conv?.userData || {};
+
+    // Si el historial está vacío, reconstruir el mensaje inicial de la plantilla para
+    // que siempre aparezca en el PDF aunque el estado no se haya persistido correctamente.
+    if (mensajes.length === 0 && userData.aseguradora && nexp) {
+      mensajes = [{
+        direction: 'out',
+        text:      buildInitialTemplateText({ aseguradora: userData.aseguradora, nexp, causa: userData.causa || userData.observaciones || '' }),
+        timestamp: null,
+      }];
+    }
     const historial = mensajes.map(m => ({
       role:  m.direction === 'in' ? 'user' : 'model',
       parts: [{ text: m.text }],

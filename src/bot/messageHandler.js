@@ -5,6 +5,7 @@ const adapter             = require('../channels/whatsappAdapter');
 const { canProcess }      = require('./stateMachine');
 const { triggerEncargoSync } = require('./peritolineAutoSync');
 const { generateConversationPdf } = require('../utils/pdfGenerator');
+const { buildInitialTemplateText } = require('./templateSender');
 const fileLogger          = require('../utils/fileLogger');
 const axios = require('axios');
 
@@ -263,7 +264,18 @@ async function processMessage(waId, messageObj) {
 
     // Leer datos del siniestro y mensajes desde Excel
     const userData        = conversation.userData || {};
-    const mensajesPrevios = conversationManager.getMensajes(waId);
+    let mensajesPrevios   = conversationManager.getMensajes(waId);
+
+    // Si el historial está vacío, reconstruir el mensaje inicial de la plantilla para
+    // que siempre aparezca en el PDF aunque el estado no se haya persistido correctamente.
+    if (mensajesPrevios.length === 0 && userData.aseguradora && nexp) {
+      mensajesPrevios = [{
+        direction: 'out',
+        text:      buildInitialTemplateText({ aseguradora: userData.aseguradora, nexp, causa: userData.causa || userData.observaciones || '' }),
+        timestamp: null,
+      }];
+    }
+
     const lastOutMsg      = [...mensajesPrevios].reverse().find(m => m?.direction === 'out') || null;
     const lastBotMessage  = lastOutMsg?.text || '';
     const relationFromCurrent = extractRelationship(text);
@@ -436,7 +448,8 @@ async function processMessage(waId, messageObj) {
       }
 
       // Disparo al cerrar conversación (principalmente para subir PDF).
-      if (!isFirstResponse && excelUpdates.contacto === 'Sí' && (stageAplicado === 'finalizado' || stageAplicado === 'escalated')) {
+      // Nota: incluye isFirstResponse para casos donde la primera respuesta ya causa escalado/finalizado.
+      if (excelUpdates.contacto === 'Sí' && (stageAplicado === 'finalizado' || stageAplicado === 'escalated')) {
         const digitalVal = excelUpdates.digital || conversation.digital;
         const horarioVal = String(excelUpdates.horario || conversation.horario || '').trim().toLowerCase();
         let horarioLabel = '';
