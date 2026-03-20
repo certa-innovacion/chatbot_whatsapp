@@ -102,6 +102,39 @@ function normalizeContactPhone(raw) {
   return digits;
 }
 
+/**
+ * Analiza si una dirección española ya incluye datos de vivienda (bloque/escalera/
+ * portal/piso) o si apunta a una vivienda unifamiliar, o si solo tiene calle+número
+ * y habría que preguntar si es un piso.
+ *
+ * @returns {'completa'|'unifamiliar'|'incompleta'}
+ */
+function analyzeAddressType(direccion) {
+  if (!direccion) return 'incompleta';
+  const d = String(direccion).toUpperCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+
+  // Ya contiene datos de piso/bloque/escalera/portal
+  if (
+    /\bBLOQUE\b/.test(d) || /\bBL[OQ]?\.?\s*\d/.test(d) ||
+    /\bESCALERA\b/.test(d) || /\bESC\.?\s*[A-Z\d]/.test(d) ||
+    /\bPORTAL\b/.test(d)  || /\bPTA?\.?\s*[A-Z\d]/.test(d) ||
+    /\bPUERTA\b/.test(d)  || /\bPISO\b/.test(d) ||
+    /\bPLANTA\b/.test(d)  || /\bPL\.?\s*\d/.test(d) ||
+    /\bAPTO\.?\b/.test(d) || /\bAPARTAMENTO\b/.test(d) ||
+    /\b\d+[°ºAa]\s*[A-Z]?\b/.test(d)   // "1ºA", "2B", "3ª", etc.
+  ) return 'completa';
+
+  // Indicios claros de vivienda unifamiliar
+  if (
+    /\bCHALET\b/.test(d) || /\bVILLA\b/.test(d) ||
+    /\bCASA\b/.test(d)   || /\bFINCA\b/.test(d) ||
+    /\bPARCELA\b/.test(d) || /\bUNIFAMILIAR\b/.test(d) ||
+    /\bURBANIZACI/.test(d)
+  ) return 'unifamiliar';
+
+  return 'incompleta';
+}
+
 function extractRelationship(text) {
   const m = String(text || '').toLowerCase().match(RELATION_RE);
   return m?.[1] ? m[1] : '';
@@ -324,6 +357,15 @@ async function processMessage(waId, messageObj) {
     if (conversation.idioma && conversation.idioma !== 'es') {
       contextoSistema += `\n[IDIOMA ACTIVO]: ${conversation.idioma} — Responde SIEMPRE en este idioma, sin excepción.`;
     }
+    // Análisis de dirección: si solo es calle+número, guiar a la IA para que pregunte datos de piso
+    const tipoVivienda = analyzeAddressType(valoresExcel.direccion);
+    if (tipoVivienda === 'incompleta') {
+      contextoSistema += `\n[DIRECCIÓN INCOMPLETA]: La dirección registrada solo contiene calle y número ("${valoresExcel.direccion}"). No se puede saber si es piso o unifamiliar. Al confirmar la dirección, pregunta SIEMPRE de forma directa si es un piso y, de serlo, solicita bloque, escalera, portal y número de vivienda. No uses forma condicional débil; pregunta con certeza.`;
+    } else if (tipoVivienda === 'completa') {
+      contextoSistema += `\n[DIRECCIÓN COMPLETA]: La dirección ya incluye datos de bloque/escalera/portal/vivienda. Confírmala tal como está; no solicites más datos de ubicación de la vivienda.`;
+    }
+    // tipoVivienda === 'unifamiliar': la IA gestiona sin hint adicional
+
     contextoSistema += '\n[Videoperitación]: Si el usuario no expresa dudas, no expliques funcionamiento; pregunta disponibilidad directa (mañana/tarde).';
     contextoSistema += '\n[DISTINCIÓN DE CAMPOS]: "Relación" es SOLO la relación del interlocutor actual con el asegurado. "AT. Perito" es SOLO la persona que atenderá al perito en la visita.';
     if (peritoAttendeeContext) {
@@ -543,5 +585,6 @@ module.exports = {
     isAffirmativeAck,
     isIdentityRelationPrompt,
     extractRelationship,
+    analyzeAddressType,
   },
 };

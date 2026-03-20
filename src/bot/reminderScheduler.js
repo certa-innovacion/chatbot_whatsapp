@@ -1,20 +1,23 @@
 // src/bot/reminderScheduler.js — Scheduler unificado
 //
-// Gestiona dos escenarios de forma independiente:
+// Regla de negocio: solo contactamos al asegurado UNA VEZ (mensaje inicial).
+// La columna "Contacto" del Excel es la fuente de verdad:
+//   - Vacío    → pendiente de contactar (sendInitialMessage.js se encarga)
+//   - "En curso" → ya contactado, conversación activa
+//   - "Sí"     → flujo completado y perito virtual desasignado
+//   - "No"     → asegurado no respondió, cerrado sin más contacto
+//
+// Gestiona dos escenarios:
 //
 //  A) SIN respuesta al primer mensaje (lastUserMessageAt = null)
-//     → Reenvía la plantilla inicial cada INITIAL_RETRY_INTERVAL_HOURS horas,
-//       hasta INITIAL_RETRY_MAX_ATTEMPTS veces.
+//     → Cuando expira el timer, cierra la conversación SIN enviar ningún
+//       mensaje adicional y marca Contacto = "No".
 //
 //  B) INACTIVIDAD a mitad de conversación (lastUserMessageAt existe pero el
 //     usuario lleva demasiado tiempo sin escribir)
-//     → Envía "MSG_INACTIVIDAD" cada INACTIVITY_INTERVAL_HOURS horas,
-//       hasta INACTIVITY_MAX_ATTEMPTS veces.
-//
-//  En ambos casos, tras agotar los intentos:
-//     • Se envía MSG_FINAL_INACTIVIDAD
-//     • Se marca Excel "Contacto" = "no"
-//     • La conversación pasa a estado "escalated"
+//     → Envía mensajes de inactividad generados por IA cada
+//       INACTIVITY_INTERVAL_MINUTES, hasta INACTIVITY_MAX_ATTEMPTS veces.
+//       Tras agotar los intentos cierra y marca Contacto = "No".
 //
 //  Los mensajes solo se envían dentro del horario L-V BUSINESS_HOURS_START–BUSINESS_HOURS_END.
 //  La limpieza del Excel se ejecuta en cada ciclo independientemente del horario.
@@ -22,22 +25,19 @@
 require('dotenv').config();
 const conversationManager = require('./conversationManager');
 const adapter             = require('../channels/whatsappAdapter');
-const { sendInitialTemplate, buildInitialTemplateText } = require('./templateSender');
+const { buildInitialTemplateText } = require('./templateSender');
 const { triggerEncargoSync } = require('./peritolineAutoSync');
 const { isBusinessHours, cleanOldRows } = require('../utils/excelManager');
 const { procesarConIA }   = require('../ai/aiModel');
 const { generateConversationPdf, cleanOldPdfs, cleanOldDebugLogs } = require('../utils/pdfGenerator');
 const fileLogger          = require('../utils/fileLogger');
 
-const CHECK_MINUTES         = Number(process.env.SCHEDULER_CHECK_MINUTES          || 15);
-const INITIAL_RETRY_MINUTES = Number(process.env.INITIAL_RETRY_INTERVAL_MINUTES   || process.env.INITIAL_RETRY_INTERVAL_HOURS * 60 || 360);
-const INITIAL_MAX_ATTEMPTS  = Number(process.env.INITIAL_RETRY_MAX_ATTEMPTS       || 3);
-const INACTIVITY_MINUTES    = Number(process.env.INACTIVITY_INTERVAL_MINUTES      || process.env.INACTIVITY_INTERVAL_HOURS * 60  || 120);
-const INACTIVITY_MAX        = Number(process.env.INACTIVITY_MAX_ATTEMPTS          || 3);
+const CHECK_MINUTES      = Number(process.env.SCHEDULER_CHECK_MINUTES         || 15);
+const INACTIVITY_MINUTES = Number(process.env.INACTIVITY_INTERVAL_MINUTES     || process.env.INACTIVITY_INTERVAL_HOURS * 60  || 120);
+const INACTIVITY_MAX     = Number(process.env.INACTIVITY_MAX_ATTEMPTS         || 3);
 
-const INITIAL_RETRY_MS  = INITIAL_RETRY_MINUTES * 60000;
-const INACTIVITY_MS     = INACTIVITY_MINUTES    * 60000;
-const BH_START          = Number(process.env.BUSINESS_HOURS_START || 9);
+const INACTIVITY_MS = INACTIVITY_MINUTES * 60000;
+const BH_START      = Number(process.env.BUSINESS_HOURS_START || 9);
 
 let _timer = null;
 
@@ -103,7 +103,8 @@ async function runChecks() {
 
     if (!usuarioRespondio) {
       // ── Escenario A: sin respuesta al primer mensaje ──────────────────────
-      await handleInitialRetry(conv, now);
+      // Regla: solo contactamos una vez. Cerrar sin enviar ningún mensaje más.
+      await finalizarSinMensaje(waId, nexp);
     } else {
       // ── Escenario B: inactividad a mitad de conversación ──────────────────
       await handleInactivity(conv, now);
@@ -111,40 +112,18 @@ async function runChecks() {
   }
 }
 
-async function handleInitialRetry(conv, now) {
-  const { waId, nexp, userData } = conv;
-  const intentos = conv.attempts || 0;
-
-  if (intentos >= INITIAL_MAX_ATTEMPTS) {
-    // Ya se agotaron — escalar si no está marcado
-    await finalizar(waId, nexp, '[IA] Asegurado no responde');
-    return;
-  }
-
-  const siguiente = intentos + 1;
-  console.log(`🔄 Reintento inicial ${siguiente}/${INITIAL_MAX_ATTEMPTS} → nexp=${nexp}`);
-
+async function finalizarSinMensaje(waId, nexp) {
   try {
-    const templateData = {
-      aseguradora: userData?.aseguradora,
-      nexp,
-      causa: userData?.causa,
-    };
-    await sendInitialTemplate(waId, 'inicio', templateData);
-    const mensajesPrevios = conversationManager.getMensajes(waId);
     conversationManager.createOrUpdateConversation(waId, {
-      attempts:       siguiente,
-      lastReminderAt: now,
-      nextReminderAt: now + INITIAL_RETRY_MS,
-      mensajes: [
-        ...mensajesPrevios,
-        { direction: 'out', text: buildInitialTemplateText(templateData), timestamp: new Date().toISOString() },
-      ],
+      stage:    'cerrado',
+      contacto: 'No',
     });
-    console.log(`✅ Reintento inicial enviado (${siguiente}/${INITIAL_MAX_ATTEMPTS})`);
+    triggerEncargoSync(nexp, 'inactividad_contacto_no', '[IA] Asegurado no responde', false, true);
+    console.log(`📭 Sin respuesta, cerrado sin recontactar: nexp=${nexp}`);
+    fileLogger.writeLog(nexp, 'INFO', `Cerrado por no respuesta (sin mensaje adicional) waId=${waId}`);
   } catch (err) {
-    console.error(`❌ Error en reintento inicial ${waId}:`, err.message);
-    fileLogger.writeLog(nexp, 'ERROR', `Error en reintento inicial waId=${waId}: ${err.message}`);
+    console.error(`❌ Error cerrando sin mensaje ${waId}:`, err.message);
+    fileLogger.writeLog(nexp, 'ERROR', `Error cerrando sin mensaje waId=${waId}: ${err.message}`);
   }
 }
 
@@ -239,15 +218,22 @@ async function finalizar(waId, nexp, anotacion = '') {
     const respuestaIA = await procesarConIA(historial, '[SISTEMA: INACTIVIDAD_FINAL]', '', valoresExcel);
     const msgCierre = respuestaIA.mensaje_para_usuario;
     await adapter.sendText(waId, msgCierre);
+
+    // Incluir el mensaje de cierre en el historial antes de guardar y generar el PDF
+    const mensajesConCierre = [
+      ...mensajes,
+      { direction: 'out', text: msgCierre, timestamp: new Date().toISOString() },
+    ];
     conversationManager.createOrUpdateConversation(waId, {
       stage:    'cerrado',
       contacto: 'No',
+      mensajes: mensajesConCierre,
     });
     triggerEncargoSync(nexp, 'inactividad_contacto_no', anotacion, false, true);
     console.log(`🚨 Escalado por inactividad: nexp=${nexp}`);
 
     // Generar PDF de transcripción al cerrar por inactividad
-    generateConversationPdf(nexp, userData, mensajes, {
+    generateConversationPdf(nexp, userData, mensajesConCierre, {
       stage:     'cerrado',
       contacto:  'No',
       attPerito: conv?.attPerito,
@@ -276,7 +262,7 @@ function startScheduler() {
   console.log('║           SCHEDULER UNIFICADO INICIADO                    ║');
   console.log('╚════════════════════════════════════════════════════════════╝');
   console.log(`   ⏱️  Verificación cada: ${CHECK_MINUTES} min`);
-  console.log(`   📩 Sin respuesta:   reenvío cada ${INITIAL_RETRY_MINUTES}min × ${INITIAL_MAX_ATTEMPTS} veces`);
+  console.log(`   📩 Sin respuesta:   cierre silencioso (sin recontactar)`);
   console.log(`   💤 Inactividad:     aviso cada ${INACTIVITY_MINUTES}min × ${INACTIVITY_MAX} veces`);
   console.log(`   🕐 Envíos: L-V ${process.env.BUSINESS_HOURS_START || 9}:00–${process.env.BUSINESS_HOURS_END || 20}:00\n`);
 

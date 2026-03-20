@@ -54,6 +54,11 @@ app.get('/health', (req, res) => {
       sampledAt:   new Date(lastRes.ts).toISOString(),
     } : null,
     peritolineQueue: getQueueStatus(),
+    messageConcurrency: {
+      active:  _activeMessages,
+      waiting: _waitingSlots.length,
+      max:     MAX_CONCURRENT_MESSAGES,
+    },
   });
 });
 
@@ -72,6 +77,36 @@ app.get('/webhook', (req, res) => {
     res.sendStatus(403);
   }
 });
+
+// ── Semáforo global de concurrencia ──────────────────────────────────────────
+// Limita el número de processMessage activos simultáneamente para evitar
+// saturación de CPU/RAM cuando responden varios asegurados a la vez.
+// Los mensajes que superen el límite esperan en cola hasta que se libere un slot.
+
+const MAX_CONCURRENT_MESSAGES = Number(process.env.MAX_CONCURRENT_MESSAGES || 5);
+let _activeMessages = 0;
+const _waitingSlots = [];
+
+function _acquireSlot() {
+  return new Promise(resolve => {
+    if (_activeMessages < MAX_CONCURRENT_MESSAGES) {
+      _activeMessages++;
+      resolve();
+    } else {
+      log.info(`⏳ Cola IA: ${_waitingSlots.length + 1} mensaje(s) esperando slot (${_activeMessages}/${MAX_CONCURRENT_MESSAGES} activos)`);
+      _waitingSlots.push(resolve);
+    }
+  });
+}
+
+function _releaseSlot() {
+  if (_waitingSlots.length > 0) {
+    const next = _waitingSlots.shift();
+    next(); // transfiere el slot al siguiente en espera sin decrementar
+  } else {
+    _activeMessages--;
+  }
+}
 
 // ── Cola de procesamiento por usuario (evita respuestas duplicadas) ──────────
 // Garantiza que los mensajes de un mismo usuario se procesen de forma secuencial.
@@ -133,10 +168,13 @@ app.post('/webhook', async (req, res) => {
   log.info(`📥 Recibido de [${log.maskPhone(msg.userId)}]: ${logPreview}`);;
 
   enqueueForUser(msg.userId, async () => {
+    await _acquireSlot();
     try {
       await processMessage(msg.userId, msg);
     } catch (err) {
       log.error('❌ Error procesando mensaje:', err);
+    } finally {
+      _releaseSlot();
     }
   });
 });
