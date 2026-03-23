@@ -1,8 +1,14 @@
 // src/bot/peritolineAutoSync.js
 // Disparador asíncrono para sincronizar un encargo en PeritoLine.
 //
+// MODO DISTRIBUIDO (SQS_QUEUE_URL configurado):
+//   Envía el job a la cola SQS. Los workers EC2 consumen la cola y ejecutan Playwright.
+//
+// MODO LOCAL (sin SQS_QUEUE_URL):
+//   Comportamiento original — lanza Playwright como child process en el mismo servidor.
+//
 // Garantías:
-//  · Máximo MAX_CONCURRENT instancias de Playwright simultáneas (evita saturación de recursos).
+//  · Máximo MAX_CONCURRENT instancias de Playwright simultáneas (modo local).
 //  · Cola persistente de reintentos para syncs que fallan por recursos.
 //  · Deduplicación: un isFinalSync siempre reemplaza a un assignOnly pendiente del mismo encargo.
 //  · No se producen comunicaciones duplicadas con el asegurado: los mensajes WhatsApp se envían
@@ -24,6 +30,10 @@ const MAX_RETRY_ATTEMPTS    = Number(process.env.PERITOLINE_MAX_RETRY_ATTEMPTS  
 const RETRY_CHECK_MS        = Number(process.env.PERITOLINE_RETRY_CHECK_MIN       || 5) * 60_000;
 const RETRY_QUEUE_PATH      = path.resolve(__dirname, '../../data/sync_retry_queue.json');
 
+// SQS: si está configurado, usar modo distribuido
+const SQS_QUEUE_URL = (process.env.SQS_QUEUE_URL || '').trim();
+const AWS_REGION    = (process.env.AWS_REGION || 'eu-south-2').trim();
+
 // Backoff en minutos por número de intento (1-based)
 const RETRY_BACKOFF_MIN = [0, 5, 15, 30, 60, 120];
 
@@ -34,6 +44,23 @@ const lastRunByEncargo = new Map();          // encargo → timestamp último sp
 const pendingFinal     = new Map();          // encargo → { anotacion } para final-sync encolado
 let   runningCount     = 0;                  // total de instancias Playwright activas
 const globalQueue      = [];                 // cola global por límite de concurrencia
+
+// ── Cliente SQS (lazy init) ───────────────────────────────────────────────────
+
+let _sqsClient = null;
+
+function getSqsClient() {
+  if (_sqsClient) return _sqsClient;
+  try {
+    const { SQSClient, SendMessageCommand } = require('@aws-sdk/client-sqs');
+    _sqsClient = { client: new SQSClient({ region: AWS_REGION }), SendMessageCommand };
+    log.info(`📨 SQS client inicializado | región: ${AWS_REGION} | cola: ${SQS_QUEUE_URL}`);
+  } catch (err) {
+    log.error('❌ No se pudo cargar @aws-sdk/client-sqs. Ejecuta: npm install @aws-sdk/client-sqs');
+    _sqsClient = null;
+  }
+  return _sqsClient;
+}
 
 // ── Cola persistente de reintentos ────────────────────────────────────────────
 
@@ -56,18 +83,11 @@ function _saveRetryQueue(queue) {
   }
 }
 
-/**
- * Añade o actualiza una entrada en la cola persistente de reintentos.
- * Reglas de deduplicación:
- *  - isFinalSync reemplaza a assignOnly para el mismo encargo.
- *  - Si ya hay un isFinalSync, se actualiza la anotación con la nueva (por si cambió).
- */
 function _enqueueRetry(key, reason, anotacion, assignOnly, isFinalSync) {
   const queue = _loadRetryQueue();
   const idx   = queue.findIndex(e => e.key === key);
   const existing = idx !== -1 ? queue[idx] : null;
 
-  // Si ya hay un finalSync en cola, no reemplazar con un assignOnly
   if (existing && existing.isFinalSync && assignOnly) {
     log.info(`⏭️  Reintento assign-only ignorado (ya hay finalSync en cola) | encargo=${key}`);
     return;
@@ -92,7 +112,7 @@ function _enqueueRetry(key, reason, anotacion, assignOnly, isFinalSync) {
   else            queue.push(entry);
 
   _saveRetryQueue(queue);
-  log.warn(`🔁 Sync añadido a cola de reintentos | encargo=${key} | intento=${attempts + 1}/${MAX_RETRY_ATTEMPTS} | próximo reintento en ${RETRY_BACKOFF_MIN[Math.min(attempts + 1, RETRY_BACKOFF_MIN.length - 1)]} min`);
+  log.warn(`🔁 Sync añadido a cola de reintentos | encargo=${key} | intento=${attempts + 1}/${MAX_RETRY_ATTEMPTS}`);
 }
 
 function _removeFromRetryQueue(key) {
@@ -100,9 +120,44 @@ function _removeFromRetryQueue(key) {
   _saveRetryQueue(queue);
 }
 
-// ── Spawn de Playwright ───────────────────────────────────────────────────────
+// ── Envío a SQS (modo distribuido) ───────────────────────────────────────────
 
-function _spawn(key, reason, anotacion, assignOnly, isFinalSync, isRetry = false) {
+async function _sendToSqs(key, reason, anotacion, assignOnly, isFinalSync) {
+  const sqs = getSqsClient();
+  if (!sqs) {
+    log.warn(`⚠️  SQS SDK no disponible, fallback a modo local | encargo=${key}`);
+    _spawnLocal(key, reason, anotacion, assignOnly, isFinalSync);
+    return;
+  }
+
+  const { client, SendMessageCommand } = sqs;
+  const messageBody = JSON.stringify({ key, reason, anotacion, assignOnly, isFinalSync });
+
+  const isFifo = SQS_QUEUE_URL.endsWith('.fifo');
+  const params = {
+    QueueUrl:    SQS_QUEUE_URL,
+    MessageBody: messageBody,
+    ...(isFifo ? {
+      MessageGroupId:         key,
+      MessageDeduplicationId: `${key}-${Date.now()}`,
+    } : {}),
+  };
+
+  try {
+    const result = await client.send(new SendMessageCommand(params));
+    log.info(`📨 Job enviado a SQS | encargo=${key} | motivo=${reason} | msgId=${result.MessageId}`);
+    fileLogger.forNexp(key).playwright(`=== Job enviado a SQS | motivo=${reason} ===`);
+    lastRunByEncargo.set(key, Date.now());
+  } catch (err) {
+    log.error(`❌ Error enviando a SQS | encargo=${key}:`, err.message);
+    fileLogger.forNexp(key).error(`Error enviando job a SQS: ${err.message}`);
+    _enqueueRetry(key, reason, anotacion, assignOnly, isFinalSync);
+  }
+}
+
+// ── Spawn local (modo original, sin SQS) ─────────────────────────────────────
+
+function _spawnLocal(key, reason, anotacion, assignOnly, isFinalSync, isRetry = false) {
   lastRunByEncargo.set(key, Date.now());
   running.add(key);
   runningCount++;
@@ -118,9 +173,8 @@ function _spawn(key, reason, anotacion, assignOnly, isFinalSync, isRetry = false
   const retry  = isRetry ? ' [REINTENTO]' : '';
   const header = `=== Sync iniciado${retry} | encargo=${key}${reason ? ` | motivo=${reason}` : ''} ===`;
 
-  // Log recursos antes de lanzar
   resourceMonitor.logStats(`before_spawn_${key}`).then(({ cpuPct, mem }) => {
-    log.info(`🚀 PeritoLine auto-sync lanzado${retry} | encargo=${key} | motivo=${reason || ''} | CPU:${cpuPct}% | RAM libre:${mem.freeMB}MB | concurrent:${runningCount}/${MAX_CONCURRENT}`);
+    log.info(`🚀 PeritoLine auto-sync lanzado${retry} | encargo=${key} | CPU:${cpuPct}% | RAM libre:${mem.freeMB}MB | concurrent:${runningCount}/${MAX_CONCURRENT}`);
   });
 
   FL.playwright(header);
@@ -165,7 +219,6 @@ function _spawn(key, reason, anotacion, assignOnly, isFinalSync, isRetry = false
     if (code === 0) {
       log.info(`✅ PeritoLine auto-sync finalizado | encargo=${key}`);
       FL.playwright(`=== Sync finalizado OK | encargo=${key} ===`);
-      // Éxito: eliminar de cola de reintentos si estaba
       _removeFromRetryQueue(key);
     } else {
       resourceMonitor.logStats(`after_failure_${key}`).then(({ cpuPct, mem }) => {
@@ -182,13 +235,28 @@ function _spawn(key, reason, anotacion, assignOnly, isFinalSync, isRetry = false
   child.unref();
 }
 
-/** Acciones tras finalizar un proceso (éxito o fallo). */
+// ── Dispatcher principal ──────────────────────────────────────────────────────
+
+/**
+ * Decide si usar SQS (modo distribuido) o spawn local.
+ * En modo SQS no aplicamos límite de concurrencia local — SQS + los workers
+ * gestionan la concurrencia de forma natural.
+ */
+function _dispatch(key, reason, anotacion, assignOnly, isFinalSync, isRetry = false) {
+  if (SQS_QUEUE_URL) {
+    _sendToSqs(key, reason, anotacion, assignOnly, isFinalSync);
+  } else {
+    _spawnOrQueue(key, reason, anotacion, assignOnly, isFinalSync, isRetry);
+  }
+}
+
+// ── Cola global (modo local) ──────────────────────────────────────────────────
+
 function _afterProcess(key) {
   _drainPendingFinal(key);
   _drainGlobalQueue();
 }
 
-/** Ejecuta el final-sync que estaba esperando a que terminara el proceso actual del encargo. */
 function _drainPendingFinal(key) {
   if (!pendingFinal.has(key)) return;
   const { anotacion } = pendingFinal.get(key);
@@ -197,24 +265,19 @@ function _drainPendingFinal(key) {
   _spawnOrQueue(key, 'pending_final', anotacion, false, true);
 }
 
-/** Procesa la cola global (disparado cuando se libera un slot de concurrencia). */
 function _drainGlobalQueue() {
   while (globalQueue.length > 0 && runningCount < MAX_CONCURRENT) {
     const next = globalQueue.shift();
     log.info(`▶ Procesando sync en cola global | encargo=${next.key} | pendientes restantes: ${globalQueue.length}`);
-    _spawn(next.key, next.reason, next.anotacion, next.assignOnly, next.isFinalSync);
+    _spawnLocal(next.key, next.reason, next.anotacion, next.assignOnly, next.isFinalSync);
   }
 }
 
-/**
- * Lanza el sync si hay slot disponible, o lo encola en la cola global.
- */
 function _spawnOrQueue(key, reason, anotacion, assignOnly, isFinalSync, isRetry = false) {
   if (runningCount < MAX_CONCURRENT) {
-    _spawn(key, reason, anotacion, assignOnly, isFinalSync, isRetry);
+    _spawnLocal(key, reason, anotacion, assignOnly, isFinalSync, isRetry);
   } else {
     log.info(`⏳ PeritoLine sync en cola global (${runningCount}/${MAX_CONCURRENT} activos) | encargo=${key}`);
-    // Si ya hay un assignOnly en cola para este encargo y llega un finalSync, reemplazar
     const existingIdx = globalQueue.findIndex(e => e.key === key);
     if (existingIdx !== -1) {
       const existing = globalQueue[existingIdx];
@@ -238,7 +301,6 @@ async function _processRetryQueue() {
   const due       = queue.filter(e => e.nextRetryAt <= now && e.attempts < MAX_RETRY_ATTEMPTS);
   const overLimit = queue.filter(e => e.attempts >= MAX_RETRY_ATTEMPTS);
 
-  // Purgar los que superaron el límite de reintentos
   if (overLimit.length) {
     overLimit.forEach(e => {
       log.error(`💀 Sync abandonado tras ${e.attempts} intentos | encargo=${e.key} | motivo=${e.reason}`);
@@ -249,34 +311,31 @@ async function _processRetryQueue() {
 
   if (!due.length) return;
 
-  // Solo reintentar si hay recursos disponibles
-  const available = await resourceMonitor.isAvailable();
-  if (!available) {
-    const { cpuPct, mem } = resourceMonitor.getLastStats() || {};
-    log.warn(`⚠️  Cola de reintentos: recursos insuficientes, postergando | CPU:${cpuPct}% | RAM libre:${mem?.freeMB}MB | pendientes: ${due.length}`);
-    return;
+  // En modo SQS no comprobamos recursos locales (el worker lo gestiona)
+  if (!SQS_QUEUE_URL) {
+    const available = await resourceMonitor.isAvailable();
+    if (!available) {
+      const { cpuPct, mem } = resourceMonitor.getLastStats() || {};
+      log.warn(`⚠️  Cola de reintentos: recursos insuficientes, postergando | CPU:${cpuPct}% | RAM libre:${mem?.freeMB}MB`);
+      return;
+    }
   }
 
-  // Procesar de uno en uno para no saturar
   const entry = due[0];
-
-  // Incrementar intento antes de lanzar
   const updatedQueue = _loadRetryQueue().map(e => {
     if (e.key !== entry.key) return e;
     return { ...e, attempts: e.attempts + 1 };
   });
   _saveRetryQueue(updatedQueue);
 
-  log.info(`🔁 Reintentando sync | encargo=${entry.key} | intento ${entry.attempts + 1}/${MAX_RETRY_ATTEMPTS} | motivo original: ${entry.reason}`);
-  fileLogger.forNexp(entry.key).playwright(`=== Reintento ${entry.attempts + 1}/${MAX_RETRY_ATTEMPTS} | motivo=${entry.reason} ===`);
+  log.info(`🔁 Reintentando sync | encargo=${entry.key} | intento ${entry.attempts + 1}/${MAX_RETRY_ATTEMPTS}`);
 
-  // Solo lanzar si el encargo no tiene ya un proceso activo
-  if (running.has(entry.key)) {
+  if (!SQS_QUEUE_URL && running.has(entry.key)) {
     log.info(`⏭️  Reintento omitido (ya en curso) | encargo=${entry.key}`);
     return;
   }
 
-  _spawnOrQueue(entry.key, `retry_${entry.reason}`, entry.anotacion, entry.assignOnly, entry.isFinalSync, true);
+  _dispatch(entry.key, `retry_${entry.reason}`, entry.anotacion, entry.assignOnly, entry.isFinalSync, true);
 }
 
 // ── API pública ───────────────────────────────────────────────────────────────
@@ -286,37 +345,48 @@ function triggerEncargoSync(encargo, reason = '', anotacion = '', assignOnly = f
   if (!key) return;
   if (!AUTO_SYNC_ENABLED) return;
 
-  if (running.has(key)) {
-    if (isFinalSync) {
-      pendingFinal.set(key, { anotacion });
-      log.info(`⏳ PeritoLine final-sync encolado (sync en curso) | encargo=${key}`);
-    } else {
-      log.info(`⏭️  PeritoLine auto-sync omitido (ya en curso) | encargo=${key}`);
+  // En modo local: gestión de concurrencia y cooldown
+  if (!SQS_QUEUE_URL) {
+    if (running.has(key)) {
+      if (isFinalSync) {
+        pendingFinal.set(key, { anotacion });
+        log.info(`⏳ PeritoLine final-sync encolado (sync en curso) | encargo=${key}`);
+      } else {
+        log.info(`⏭️  PeritoLine auto-sync omitido (ya en curso) | encargo=${key}`);
+      }
+      return;
     }
-    return;
+
+    const now  = Date.now();
+    const last = lastRunByEncargo.get(key) || 0;
+    if (!isFinalSync && now - last < AUTO_SYNC_COOLDOWN_MS) {
+      log.info(`⏭️  PeritoLine auto-sync omitido (cooldown) | encargo=${key}`);
+      return;
+    }
+  } else {
+    // En modo SQS: solo aplicar cooldown para evitar duplicados en cola
+    const now  = Date.now();
+    const last = lastRunByEncargo.get(key) || 0;
+    if (!isFinalSync && now - last < AUTO_SYNC_COOLDOWN_MS) {
+      log.info(`⏭️  PeritoLine auto-sync omitido (cooldown SQS) | encargo=${key}`);
+      return;
+    }
   }
 
-  // Cooldown solo para syncs no-finales
-  const now  = Date.now();
-  const last = lastRunByEncargo.get(key) || 0;
-  if (!isFinalSync && now - last < AUTO_SYNC_COOLDOWN_MS) {
-    log.info(`⏭️  PeritoLine auto-sync omitido (cooldown) | encargo=${key}`);
-    return;
-  }
-
-  _spawnOrQueue(key, reason, anotacion, assignOnly, isFinalSync);
+  _dispatch(key, reason, anotacion, assignOnly, isFinalSync);
 }
 
-/** Devuelve un resumen del estado actual (para health checks / logs). */
 function getQueueStatus() {
   return {
+    mode:           SQS_QUEUE_URL ? 'sqs' : 'local',
+    sqsQueueUrl:    SQS_QUEUE_URL || null,
     runningCount,
     maxConcurrent:  MAX_CONCURRENT,
     globalQueueLen: globalQueue.length,
     retryQueueLen:  _loadRetryQueue().length,
     retryQueue:     _loadRetryQueue().map(e => ({
-      key:        e.key,
-      attempts:   e.attempts,
+      key:         e.key,
+      attempts:    e.attempts,
       isFinalSync: e.isFinalSync,
       nextRetryAt: new Date(e.nextRetryAt).toISOString(),
     })),
@@ -325,17 +395,17 @@ function getQueueStatus() {
 
 // ── Arranque ──────────────────────────────────────────────────────────────────
 
-// Iniciar el scheduler de reintentos
 const _retryTimer = setInterval(_processRetryQueue, RETRY_CHECK_MS);
 if (_retryTimer.unref) _retryTimer.unref();
-log.info(`🔁 Scheduler de reintentos PeritoLine iniciado (intervalo: ${RETRY_CHECK_MS / 60_000} min, cola: data/sync_retry_queue.json)`);
 
-// Log inicial del estado de la cola (por si hay reintentos pendientes de antes del restart)
+const modeLabel = SQS_QUEUE_URL ? `SQS (${SQS_QUEUE_URL})` : `local (max ${MAX_CONCURRENT} concurrent)`;
+log.info(`🔁 PeritoLine auto-sync iniciado | modo: ${modeLabel} | retry check: ${RETRY_CHECK_MS / 60_000} min`);
+
 setTimeout(() => {
   const pending = _loadRetryQueue();
   if (pending.length) {
     log.warn(`📋 Cola de reintentos cargada al arranque: ${pending.length} entrada(s) pendiente(s)`);
-    pending.forEach(e => log.warn(`   · encargo=${e.key} | intento=${e.attempts}/${MAX_RETRY_ATTEMPTS} | motivo=${e.reason} | próximo: ${new Date(e.nextRetryAt).toISOString()}`));
+    pending.forEach(e => log.warn(`   · encargo=${e.key} | intento=${e.attempts}/${MAX_RETRY_ATTEMPTS} | motivo=${e.reason}`));
   }
 }, 3000);
 
